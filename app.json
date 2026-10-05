@@ -1,0 +1,40 @@
+{
+  "expo" : {
+    "name" : "墨思",
+    "slug" : "mosi-journal",
+    "scheme" : "appemmsn1beycxt",
+    "version" : "1.0.25",
+    "orientation" : "portrait",
+    "icon" : "./assets/icon.png",
+    "userInterfaceStyle" : "light",
+    "ios" : {
+      "supportsTablet" : true,
+      "buildNumber" : "1",
+      "bundleIdentifier" : "com.miaoda.appeoexbc33p0xu"
+    },
+    "android" : {
+      "adaptiveIcon" : {
+        "foregroundImage" : "./assets/adaptive-icon.png",
+        "backgroundColor" : "#F9F8F6"
+      },
+      "predictiveBackGestureEnabled" : false,
+      "versionCode" : 1,
+      "package" : "com.miaoda.appeoexbc33p0xu"
+    },
+    "web" : {
+      "bundler" : "metro",
+      "favicon" : "./assets/favicon.png"
+    },
+    "plugins" : [ "expo-router", "expo-asset", "expo-sqlite", "expo-font", "expo-system-ui", "expo-image", "expo-sharing", "expo-file-system", "expo-document-picker", [ "expo-local-authentication", {
+      "faceIDPermission" : "允许墨思使用面容或指纹识别快速登录"
+    } ], [ "expo-image-picker", {
+      "photosPermission" : "允许墨思访问您的相册以插入日志配图"
+    } ], "@react-native-async-storage/expo-with-async-storage" ],
+    "router" : {
+      "root" : "src"
+    },
+    "experiments" : {
+      "typedRoutes" : true
+    }
+  }
+}
