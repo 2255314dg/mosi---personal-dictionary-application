@@ -1,143 +1,154 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as SecureStore from 'expo-secure-store';
 import * as LocalAuthentication from 'expo-local-authentication';
+import * as Crypto from 'expo-crypto';
+import { Platform } from 'react-native';
+import { supabase } from '@/client/supabase';
 
-export const PIN_KEY = 'mosi_security_pin_code_v1';
-export const PIN_ENABLED_KEY = 'mosi_security_pin_enabled_v1';
-export const BIOMETRIC_ENABLED_KEY = 'mosi_security_biometric_enabled_v1';
-export const BIOMETRIC_USER_CREDENTIALS_KEY = 'mosi_biometric_credentials_v1';
+export const PIN_KEY = 'mosi_security_pin_code_v3';
+export const GESTURE_KEY = 'mosi_security_gesture_v1';
+export const DEVICE_ID_KEY = 'mosi_device_id_v1';
+export const BIOMETRIC_ENABLED_KEY = 'mosi_biometric_enabled_v3';
 
-// 密码强度校验：至少8位，包含大写字母、小写字母和数字
-export function checkPasswordStrength(password: string): { valid: boolean; message: string } {
-  if (password.length < 8) {
-    return { valid: false, message: '密码长度至少需8位字符' };
-  }
-  const hasUpperCase = /[A-Z]/.test(password);
-  const hasLowerCase = /[a-z]/.test(password);
-  const hasNumber = /[0-9]/.test(password);
-
-  if (!hasUpperCase || !hasLowerCase || !hasNumber) {
-    return { valid: false, message: '密码需同时包含大写字母、小写字母和数字' };
-  }
-
-  return { valid: true, message: '密码强度合格' };
+export interface MosiSecurityPolicy {
+  security_pin_enabled: boolean;
+  security_gesture_enabled: boolean;
+  autosave_interval_seconds: number;
+  local_backup_interval_seconds: number;
+  device_allowlist_enabled: boolean;
+  share_link_default_days: number;
 }
 
-// 检查设备是否支持生物识别
-export async function checkBiometricSupport(): Promise<{
-  supported: boolean;
-  enrolled: boolean;
-  biometryType: string;
-}> {
+const DEFAULT_POLICY: MosiSecurityPolicy = {
+  security_pin_enabled: true,
+  security_gesture_enabled: true,
+  autosave_interval_seconds: 30,
+  local_backup_interval_seconds: 60,
+  device_allowlist_enabled: true,
+  share_link_default_days: 30,
+};
+
+export async function getSecurityPolicy(): Promise<MosiSecurityPolicy> {
   try {
-    const hasHardware = await LocalAuthentication.hasHardwareAsync();
-    const isEnrolled = await LocalAuthentication.isEnrolledAsync();
-    const types = await LocalAuthentication.supportedAuthenticationTypesAsync();
-
-    let typeStr = '指纹/面容';
-    if (types.includes(LocalAuthentication.AuthenticationType.FACIAL_RECOGNITION)) {
-      typeStr = '面容识别 (Face ID)';
-    } else if (types.includes(LocalAuthentication.AuthenticationType.FINGERPRINT)) {
-      typeStr = '指纹识别';
-    }
-
+    const { data, error } = await supabase.rpc('get_mosi_security_policy');
+    if (error || !data) return DEFAULT_POLICY;
     return {
-      supported: hasHardware,
-      enrolled: isEnrolled,
-      biometryType: typeStr,
+      ...DEFAULT_POLICY,
+      ...data,
+      autosave_interval_seconds: Math.max(30, Number(data.autosave_interval_seconds ?? 30)),
+      local_backup_interval_seconds: Math.max(60, Number(data.local_backup_interval_seconds ?? 60)),
+      share_link_default_days: Math.max(0, Number(data.share_link_default_days ?? 30)),
     };
   } catch {
-    return { supported: false, enrolled: false, biometryType: '生物识别' };
+    return DEFAULT_POLICY;
   }
 }
 
-// 触发生物识别验证
-export async function authenticateWithBiometrics(promptMessage = '请验证身份以进入墨思'): Promise<boolean> {
-  try {
-    const support = await checkBiometricSupport();
-    if (!support.supported || !support.enrolled) return false;
+export async function setSecurityPolicy(key: keyof MosiSecurityPolicy, value: boolean | number): Promise<boolean> {
+  const normalized = typeof value === 'number'
+    ? (key === 'autosave_interval_seconds' ? Math.max(30, value) : key === 'local_backup_interval_seconds' ? Math.max(60, value) : value)
+    : value;
+  const { error } = await supabase.rpc('set_mosi_security_policy', { p_key: key, p_value: normalized });
+  return !error;
+}
 
-    const result = await LocalAuthentication.authenticateAsync({
-      promptMessage,
-      cancelLabel: '取消',
-      disableDeviceFallback: false,
+export async function getOrCreateDeviceId(): Promise<string> {
+  let value = await SecureStore.getItemAsync(DEVICE_ID_KEY);
+  if (!value) {
+    value = Crypto.randomUUID();
+    await SecureStore.setItemAsync(DEVICE_ID_KEY, value, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+  }
+  return value;
+}
+
+export async function initializeMosiDevice(): Promise<{ deviceId: string; approved: boolean; message: string }> {
+  const deviceId = await getOrCreateDeviceId();
+  // Supabase PostgREST reads this header from request.headers in RLS functions.
+  const client: any = supabase as any;
+  if (client.rest?.headers) client.rest.headers['x-mosi-device-id'] = deviceId;
+  if (client.realtime?.setHeaders) client.realtime.setHeaders({ 'x-mosi-device-id': deviceId });
+
+  try {
+    const { data, error } = await supabase.rpc('register_mosi_device', {
+      p_device_id: deviceId,
+      p_device_name: `${Platform.OS === 'web' ? 'Web' : Platform.OS === 'ios' ? 'iPhone/iPad' : 'Android'} · 墨思`,
+      p_platform: Platform.OS,
+      p_app_version: '1.2.0-v4.1',
     });
-
-    return result.success;
-  } catch (err) {
-    console.error('authenticateWithBiometrics error:', err);
-    return false;
-  }
-}
-
-// 获取生物识别开关状态
-export async function getBiometricEnabled(): Promise<boolean> {
-  const val = await AsyncStorage.getItem(BIOMETRIC_ENABLED_KEY);
-  return val === 'true';
-}
-
-// 设置生物识别开关
-export async function setBiometricEnabled(enabled: boolean, credentials?: { username: string; password?: string }): Promise<void> {
-  await AsyncStorage.setItem(BIOMETRIC_ENABLED_KEY, enabled ? 'true' : 'false');
-  if (enabled && credentials) {
-    await AsyncStorage.setItem(BIOMETRIC_USER_CREDENTIALS_KEY, JSON.stringify(credentials));
-  } else if (!enabled) {
-    await AsyncStorage.removeItem(BIOMETRIC_USER_CREDENTIALS_KEY);
-  }
-}
-
-// 获取存储的生物识别免密凭据
-export async function getBiometricCredentials(): Promise<{ username: string; password?: string } | null> {
-  try {
-    const raw = await AsyncStorage.getItem(BIOMETRIC_USER_CREDENTIALS_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (error) return { deviceId, approved: false, message: '设备已登记，等待管理员授权' };
+    const row = Array.isArray(data) ? data[0] : data;
+    return { deviceId, approved: Boolean(row?.approved), message: row?.message || '设备状态未知' };
   } catch {
-    return null;
+    return { deviceId, approved: false, message: '设备授权服务暂不可用' };
   }
 }
 
-// 获取 PIN 码设置状态
-export async function getPinStatus(): Promise<{ enabled: boolean; pin: string | null }> {
-  const enabledVal = await AsyncStorage.getItem(PIN_ENABLED_KEY);
-  const pin = await AsyncStorage.getItem(PIN_KEY);
+export async function getPin(): Promise<string | null> {
+  return SecureStore.getItemAsync(PIN_KEY);
+}
+
+export async function savePinCode(pin: string): Promise<boolean> {
+  if (!/^\d{4,6}$/.test(pin)) return false;
+  await SecureStore.setItemAsync(PIN_KEY, pin, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+  return true;
+}
+
+export async function disablePinCode(): Promise<void> {
+  await SecureStore.deleteItemAsync(PIN_KEY);
+}
+
+export async function verifyPinCode(pin: string): Promise<boolean> {
+  const stored = await SecureStore.getItemAsync(PIN_KEY);
+  return !!stored && stored === pin;
+}
+
+export async function getGesturePattern(): Promise<string | null> {
+  return SecureStore.getItemAsync(GESTURE_KEY);
+}
+
+export async function saveGesturePattern(pattern: number[]): Promise<boolean> {
+  const normalized = pattern.join('-');
+  if (pattern.length < 4 || new Set(pattern).size !== pattern.length) return false;
+  await SecureStore.setItemAsync(GESTURE_KEY, normalized, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+  return true;
+}
+
+export async function verifyGesturePattern(pattern: number[]): Promise<boolean> {
+  const stored = await SecureStore.getItemAsync(GESTURE_KEY);
+  return !!stored && stored === pattern.join('-');
+}
+
+export async function clearGesturePattern(): Promise<void> {
+  await SecureStore.deleteItemAsync(GESTURE_KEY);
+}
+
+export async function getProtectionStatus(): Promise<{ pin: boolean; gesture: boolean }> {
+  const [pin, gesture, policy] = await Promise.all([getPin(), getGesturePattern(), getSecurityPolicy()]);
   return {
-    enabled: enabledVal === 'true' && !!pin,
-    pin,
+    pin: Boolean(policy.security_pin_enabled && pin),
+    gesture: Boolean(policy.security_gesture_enabled && gesture),
   };
 }
 
-// 设置 / 开启 PIN 码
-export async function savePinCode(pin: string): Promise<boolean> {
-  if (pin.length < 4 || pin.length > 6) return false;
-  await AsyncStorage.setItem(PIN_KEY, pin);
-  await AsyncStorage.setItem(PIN_ENABLED_KEY, 'true');
-  return true;
+export async function getBiometricEnabled(): Promise<boolean> {
+  return (await SecureStore.getItemAsync(BIOMETRIC_ENABLED_KEY)) === 'true';
 }
 
-// 关闭 PIN 码
-export async function disablePinCode(): Promise<void> {
-  await AsyncStorage.setItem(PIN_ENABLED_KEY, 'false');
-  await AsyncStorage.removeItem(PIN_KEY);
+export async function setBiometricEnabled(enabled: boolean): Promise<void> {
+  if (enabled) await SecureStore.setItemAsync(BIOMETRIC_ENABLED_KEY, 'true');
+  else await SecureStore.deleteItemAsync(BIOMETRIC_ENABLED_KEY);
 }
 
-// 校验 PIN 码
-export async function verifyPinCode(pin: string): Promise<boolean> {
-  const stored = await AsyncStorage.getItem(PIN_KEY);
-  return stored === pin;
+export async function authenticateWithBiometrics(promptMessage = '请验证身份'): Promise<boolean> {
+  const compatible = await LocalAuthentication.hasHardwareAsync();
+  const enrolled = await LocalAuthentication.isEnrolledAsync();
+  if (!compatible || !enrolled) return false;
+  const result = await LocalAuthentication.authenticateAsync({ promptMessage, fallbackLabel: '使用设备密码' });
+  return result.success;
 }
 
-// 检查是否设置了 PIN 码
-export async function hasPinCode(): Promise<boolean> {
-  const { enabled, pin } = await getPinStatus();
-  return enabled && !!pin;
-}
-
-// 开启生物识别
-export async function enableBiometric(credentials?: { username: string; password?: string }): Promise<boolean> {
-  await setBiometricEnabled(true, credentials);
-  return true;
-}
-
-// 检查生物识别是否开启
-export async function isBiometricEnabled(): Promise<boolean> {
-  return await getBiometricEnabled();
+export async function getBiometryType(): Promise<'指纹' | '面容' | '生物识别'> {
+  const type = await LocalAuthentication.supportedAuthenticationTypesAsync();
+  if (type.includes(LocalAuthentication.AuthenticationType.FACIAL_RECOGNITION)) return '面容';
+  if (type.includes(LocalAuthentication.AuthenticationType.FINGERPRINT)) return '指纹';
+  return '生物识别';
 }

@@ -110,6 +110,7 @@ export async function getJournals(params?: JournalFilterParams): Promise<Journal
 
   const { data, error } = await query;
   if (error) {
+    if ((error as any).code === '42501' || /row-level security|permission denied|forbidden/i.test(error.message || '')) return [];
     console.warn('getJournals 网络或查询异常，尝试使用本地备份降级:', error);
     try {
       const backup = await getLocalBackupData();
@@ -171,11 +172,8 @@ export async function incrementJournalViews(id: string): Promise<void> {
       }
       window.localStorage.setItem(key, String(now));
     }
-    // 增加计数
-    const { data } = await supabase.from('journals').select('views_count').eq('id', id).single();
-    if (data) {
-      await supabase.from('journals').update({ views_count: (data.views_count || 0) + 1 }).eq('id', id);
-    }
+    // 使用数据库 RPC 原子递增，避免“读取→更新”竞态，也不需要向普通用户开放 journals UPDATE 权限。
+    await supabase.rpc('increment_journal_views', { p_journal_id: id });
   } catch {
     // ignore
   }
@@ -193,6 +191,7 @@ export async function saveJournal(payload: {
   location_tag?: string;
   created_at?: string;
   version_note?: string;
+  createVersion?: boolean;
 }): Promise<{ data: Journal | null; error: Error | null }> {
   const cType = payload.content_type || detectContentType(payload.content);
   const now = new Date().toISOString();
@@ -219,12 +218,14 @@ export async function saveJournal(payload: {
     if (error) return { data: null, error: new Error(error.message) };
 
     // 保存历史版本
-    await supabase.from('journal_versions').insert({
-      journal_id: payload.id,
-      title: payload.title,
-      content: payload.content,
-      version_note: payload.version_note || '内容更新',
-    });
+    if (payload.createVersion !== false) {
+      await supabase.from('journal_versions').insert({
+        journal_id: payload.id,
+        title: payload.title,
+        content: payload.content,
+        version_note: payload.version_note || '内容更新',
+      });
+    }
 
     // 自动备份关键数据
     triggerAutoBackupDebounced();
@@ -235,6 +236,7 @@ export async function saveJournal(payload: {
     const { data, error } = await supabase
       .from('journals')
       .insert({
+        author_id: (await supabase.auth.getUser()).data.user?.id || null,
         title: payload.title,
         content: payload.content,
         content_type: cType,
@@ -250,12 +252,14 @@ export async function saveJournal(payload: {
     if (error) return { data: null, error: new Error(error.message) };
 
     if (data) {
-      await supabase.from('journal_versions').insert({
-        journal_id: data.id,
-        title: payload.title,
-        content: payload.content,
-        version_note: '初始创建',
-      });
+      if (payload.createVersion !== false) {
+        await supabase.from('journal_versions').insert({
+          journal_id: data.id,
+          title: payload.title,
+          content: payload.content,
+          version_note: '初始创建',
+        });
+      }
     }
 
     // 自动备份关键数据
@@ -379,20 +383,38 @@ export async function deleteMusicTrackDB(id: string): Promise<boolean> {
  * @param fileName 原始文件名
  * @param mimeType 文件 MIME 类型
  */
+const MAX_MUSIC_BYTES = 50 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const ALLOWED_MUSIC_EXT = new Set(['mp3', 'm4a', 'wav', 'ogg']);
+const ALLOWED_IMAGE_EXT = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']);
+
+async function assertAdminForUpload(): Promise<void> {
+  if (!(await checkIsAdmin())) throw new Error('仅管理员可以上传文件');
+}
+
+async function fetchArrayBufferWithLimit(uri: string, maxBytes: number): Promise<ArrayBuffer> {
+  const response = await fetch(uri);
+  if (!response.ok) throw new Error(`文件读取失败（HTTP ${response.status}）`);
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength > maxBytes) throw new Error(`文件超过大小限制：${Math.round(maxBytes / 1024 / 1024)}MB`);
+  return buffer;
+}
+
 export async function uploadMusicFile(
   fileUri: string,
   fileName: string,
   mimeType = 'audio/mpeg'
 ): Promise<string> {
+  await assertAdminForUpload();
   const fileExt = fileName.split('.').pop()?.toLowerCase() || 'mp3';
+  if (!ALLOWED_MUSIC_EXT.has(fileExt)) throw new Error('不支持的音频格式，仅允许 MP3/M4A/WAV/OGG');
   const cleanBaseName = fileName
     .replace(/\.[^/.]+$/, '')
     .replace(/[^a-zA-Z0-9_]/g, '_')
     .slice(0, 30);
   const uniqueKey = `${Date.now()}_${cleanBaseName || 'audio'}.${fileExt}`;
 
-  const response = await fetch(fileUri);
-  const arrayBuffer = await response.arrayBuffer();
+  const arrayBuffer = await fetchArrayBufferWithLimit(fileUri, MAX_MUSIC_BYTES);
 
   const { error } = await supabase.storage
     .from('music')
@@ -418,21 +440,22 @@ export async function uploadJournalImage(
   imageUri: string,
   fileName?: string
 ): Promise<string> {
+  await assertAdminForUpload();
   const ext = fileName ? fileName.split('.').pop()?.toLowerCase() || 'jpg' : 'jpg';
+  if (!ALLOWED_IMAGE_EXT.has(ext)) throw new Error('不支持的图片格式，仅允许 JPG/JPEG/PNG/WEBP');
   const uniqueKey = `images/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
 
-  const response = await fetch(imageUri);
-  const arrayBuffer = await response.arrayBuffer();
+  const arrayBuffer = await fetchArrayBufferWithLimit(imageUri, MAX_IMAGE_BYTES);
 
   const { error } = await supabase.storage
     .from('journal-images')
     .upload(uniqueKey, arrayBuffer, {
-      contentType: ext === 'png' ? 'image/png' : 'image/jpeg',
+      contentType: ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg',
       upsert: false,
     });
 
   if (error) {
-    throw new Error(`图片上传失败: ${error.message}`);
+    throw new Error(`图片上传失败：${error.message}`);
   }
 
   const { data: urlData } = supabase.storage.from('journal-images').getPublicUrl(uniqueKey);
@@ -565,7 +588,7 @@ export async function checkIsAdmin(): Promise<boolean> {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return false;
     const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
-    return Boolean(profile?.role === 'admin' || user.email?.includes('admin'));
+    return profile?.role === 'admin';
   } catch {
     return false;
   }
@@ -582,7 +605,6 @@ export interface UserProfileData {
   role: string;
   created_at: string;
   security_question?: string;
-  security_answer?: string;
 }
 
 // 获取当前用户 Profile 详情与统计
@@ -596,10 +618,10 @@ export async function getCurrentUserProfile(): Promise<{
     if (!user) return { profile: null, journalsCount: 0, commentsCount: 0 };
 
     // 获取 profile
-    let { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).single();
+    let { data: profile } = await supabase.from('profiles').select('id,username,nickname,avatar_url,role,created_at,updated_at,real_name,gender,bio,security_question').eq('id', user.id).single();
     if (!profile) {
       // 容错插入
-      const role = user.email?.includes('admin') ? 'admin' : 'user';
+      const role = 'user';
       const username = user.email?.split('@')[0] || '读者';
       const insertRes = await supabase.from('profiles').insert({
         id: user.id,
@@ -612,8 +634,8 @@ export async function getCurrentUserProfile(): Promise<{
 
     // 获取统计
     const [jCountRes, cCountRes] = await Promise.all([
-      supabase.from('journals').select('id', { count: 'exact', head: true }),
-      supabase.from('comments').select('id', { count: 'exact', head: true }),
+      supabase.from('journals').select('id', { count: 'exact', head: true }).eq('author_id', user.id),
+      supabase.from('comments').select('id', { count: 'exact', head: true }).eq('user_id', user.id),
     ]);
 
     return {
@@ -649,11 +671,22 @@ export async function updateUserProfile(payload: {
     if (payload.gender !== undefined) updateData.gender = payload.gender;
     if (payload.bio !== undefined) updateData.bio = payload.bio.trim();
     if (payload.avatar_url !== undefined) updateData.avatar_url = payload.avatar_url;
-    if (payload.security_question !== undefined) updateData.security_question = payload.security_question;
-    if (payload.security_answer !== undefined) updateData.security_answer = payload.security_answer;
+    if (Object.keys(updateData).length > 1) {
+      const { error } = await supabase.from('profiles').update(updateData).eq('id', user.id);
+      if (error) throw error;
+    }
 
-    const { error } = await supabase.from('profiles').update(updateData).eq('id', user.id);
-    if (error) throw error;
+    if (payload.security_question !== undefined || payload.security_answer !== undefined) {
+      if (!payload.security_question || !payload.security_answer) {
+        throw new Error('安全问题与答案必须同时填写');
+      }
+      const { error } = await supabase.rpc('set_security_answer', {
+        p_question: payload.security_question,
+        p_answer: payload.security_answer,
+      });
+      if (error) throw error;
+    }
+
     triggerAutoBackupDebounced();
     return { success: true };
   } catch (err: any) {
@@ -740,66 +773,24 @@ export async function updateRequireInvitationCodeSetting(required: boolean): Pro
 }
 
 // 校验邀请码有效性 (code 存在、is_active=true、未过期、未超限)
-export async function verifyInvitationCode(code: string): Promise<{ valid: boolean; message?: string; record?: InvitationCode }> {
+export async function verifyInvitationCode(code: string): Promise<{ valid: boolean; message?: string }> {
   const cleanCode = code.trim().toUpperCase();
-  if (!cleanCode) {
-    return { valid: false, message: '请输入邀请码' };
-  }
+  if (!cleanCode) return { valid: false, message: '请输入邀请码' };
 
-  const { data, error } = await supabase
-    .from('invitation_codes')
-    .select('*')
-    .ilike('code', cleanCode)
-    .maybeSingle();
-
-  if (error || !data) {
-    return { valid: false, message: '邀请码无效或不存在' };
-  }
-
-  const item = data as InvitationCode;
-
-  if (!item.is_active) {
-    return { valid: false, message: '该邀请码已被管理员停用' };
-  }
-
-  if (item.expires_at && new Date(item.expires_at) < new Date()) {
-    return { valid: false, message: '该邀请码已过期' };
-  }
-
-  if (item.max_uses > 0 && item.uses_count >= item.max_uses) {
-    return { valid: false, message: '邀请码无效或已被使用' };
-  }
-
-  return { valid: true, record: item };
+  const { data, error } = await supabase.rpc('verify_invitation_code', { p_code: cleanCode });
+  if (error || !data?.[0]) return { valid: false, message: '邀请码校验服务暂不可用' };
+  return { valid: Boolean(data[0].valid), message: data[0].message };
 }
 
-// 标记邀请码为已使用
+// 使用数据库原子 RPC 核销邀请码，避免并发注册时超额使用。
 export async function consumeInvitationCode(code: string, userId: string): Promise<boolean> {
-  const cleanCode = code.trim().toUpperCase();
-  const { data: record } = await supabase
-    .from('invitation_codes')
-    .select('*')
-    .ilike('code', cleanCode)
-    .maybeSingle();
-
-  if (!record) return false;
-
-  const newCount = (record.uses_count || 0) + 1;
-  const updatePayload: Record<string, unknown> = {
-    uses_count: newCount,
-    used_at: new Date().toISOString(),
-  };
-
-  if (!record.used_by) {
-    updatePayload.used_by = userId;
-  }
-
-  const { error } = await supabase
-    .from('invitation_codes')
-    .update(updatePayload)
-    .eq('id', record.id);
-
-  return !error;
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user || user.id !== userId) return false;
+  const { data, error } = await supabase.rpc('consume_invitation_code', {
+    p_code: code.trim().toUpperCase(),
+    p_user_id: userId,
+  });
+  return !error && data === true;
 }
 
 // 获取全部邀请码列表 (管理员)
@@ -816,11 +807,13 @@ export async function getInvitationCodes(): Promise<InvitationCode[]> {
 // 生成新的邀请码 (管理员)
 export function generateRandomCode(length = 8): string {
   const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  const bytes = new Uint32Array(length);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < length; i++) bytes[i] = Math.floor(Math.random() * 0xffffffff);
   }
-  return result;
+  return Array.from(bytes, (n) => chars[n % chars.length]).join('');
 }
 
 export async function createInvitationCode(params: {
@@ -875,3 +868,336 @@ export async function deleteInvitationCode(id: string): Promise<boolean> {
   return !error;
 }
 
+
+// ---------------- V4.1 / V5 foundation ----------------
+export interface SecurityPolicy {
+  security_pin_enabled: boolean;
+  security_gesture_enabled: boolean;
+  autosave_interval_seconds: number;
+  local_backup_interval_seconds: number;
+  device_allowlist_enabled: boolean;
+  share_link_default_days: number;
+}
+
+export interface DeviceRegistryItem {
+  id: string;
+  device_id: string;
+  user_id: string;
+  device_name: string;
+  platform: string;
+  app_version?: string;
+  approved: boolean;
+  approved_by?: string;
+  approved_at?: string;
+  last_seen_at?: string;
+  created_at: string;
+}
+
+export interface AuditLogItem {
+  id: number;
+  actor_user_id?: string;
+  actor_device_id?: string;
+  action: string;
+  entity_type: string;
+  entity_id?: string;
+  severity: 'info' | 'warning' | 'critical';
+  before_data?: any;
+  after_data?: any;
+  metadata?: any;
+  created_at: string;
+}
+
+export async function getSecurityPolicyDB(): Promise<SecurityPolicy | null> {
+  const { data, error } = await supabase.rpc('get_mosi_security_policy');
+  if (error || !data) return null;
+  return data as SecurityPolicy;
+}
+
+export async function setSecurityPolicyDB(key: keyof SecurityPolicy, value: boolean | number): Promise<boolean> {
+  const { error } = await supabase.rpc('set_mosi_security_policy', { p_key: key, p_value: value });
+  return !error;
+}
+
+export async function getDeviceRegistry(): Promise<DeviceRegistryItem[]> {
+  const { data, error } = await supabase.from('device_registry').select('*').order('created_at', { ascending: false });
+  return error ? [] : (data as DeviceRegistryItem[]);
+}
+
+export async function setDeviceApproval(id: string, approved: boolean): Promise<boolean> {
+  const { data, error } = await supabase.rpc('set_device_approval', { p_device_registry_id: id, p_approved: approved });
+  return !error && data === true;
+}
+
+export async function getAuditLogs(limit = 200): Promise<AuditLogItem[]> {
+  const { data, error } = await supabase.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(limit);
+  return error ? [] : (data as AuditLogItem[]);
+}
+
+export async function createShareLink(journalId: string, days?: number): Promise<{ token: string; url: string; expires_at: string | null } | null> {
+  const { data, error } = await supabase.rpc('create_mosi_share_link', { p_journal_id: journalId, p_days: days ?? null });
+  if (error || !data) return null;
+  const row = Array.isArray(data) ? data[0] : data;
+  return row || null;
+}
+
+export interface SharedJournal {
+  title: string;
+  content: string;
+  content_type: string;
+  theme_tags: string[];
+  mood_tag: string;
+  weather_tag: string;
+  location_tag: string;
+  created_at: string;
+  expires_at: string | null;
+  share_id: string;
+}
+
+export async function getSharedJournal(token: string): Promise<SharedJournal | null> {
+  const { data, error } = await supabase.rpc('get_mosi_shared_journal', { p_token: token });
+  if (error || !data) return null;
+  const row = Array.isArray(data) ? data[0] : data;
+  return row || null;
+}
+
+export async function revokeShareLink(shareId: string): Promise<boolean> {
+  const { data, error } = await supabase.rpc('revoke_mosi_share_link', { p_share_id: shareId });
+  return !error && data === true;
+}
+
+// ----------------- V4.2 Structured Personal Thought Database -----------------
+
+export type ThoughtEntityType = 'concept' | 'person' | 'theory' | 'claim' | 'argument';
+export type ThoughtJournalRole = 'mentioned' | 'core' | 'supporting' | 'counterpoint' | 'source' | 'question';
+
+export interface ThoughtBase {
+  id: string;
+  name: string;
+  canonical_key?: string;
+  aliases?: string[];
+  summary?: string;
+  description?: string;
+  metadata?: Record<string, any>;
+  created_by?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ThoughtConcept extends ThoughtBase {}
+export interface ThoughtPerson extends ThoughtBase {
+  birth_year?: number | null;
+  death_year?: number | null;
+  roles?: string[];
+}
+export interface ThoughtTheory extends ThoughtBase {
+  school?: string;
+  period?: string;
+}
+export interface ThoughtClaim extends Omit<ThoughtBase, 'name'> {
+  statement: string;
+  stance: 'supports' | 'opposes' | 'neutral' | 'question';
+  confidence?: number | null;
+  source_note?: string;
+}
+export interface ThoughtArgument extends ThoughtBase {
+  argument_type?: string;
+  thesis?: string;
+  premises?: string[];
+  conclusion?: string;
+  strength?: number | null;
+  counterargument?: string;
+}
+
+export interface JournalEntityLink {
+  id: string;
+  journal_id: string;
+  entity_type: ThoughtEntityType;
+  entity_id: string;
+  role: ThoughtJournalRole;
+  mention: string;
+  note: string;
+  sort_order: number;
+  created_by?: string | null;
+  created_at: string;
+  entity?: ThoughtBase & { statement?: string };
+}
+
+export interface JournalRelation {
+  id: string;
+  journal_id?: string | null;
+  source_type: ThoughtEntityType;
+  source_id: string;
+  target_type: ThoughtEntityType;
+  target_id: string;
+  relation_type: string;
+  weight?: number | null;
+  note: string;
+  created_by?: string | null;
+  created_at: string;
+}
+
+export interface ThoughtEntitySummary {
+  id: string;
+  entity_type: ThoughtEntityType;
+  name: string;
+  summary: string;
+  aliases: string[];
+  updated_at: string;
+}
+
+const THOUGHT_TABLE: Record<ThoughtEntityType, string> = {
+  concept: 'thought_concepts',
+  person: 'thought_people',
+  theory: 'thought_theories',
+  claim: 'thought_claims',
+  argument: 'thought_arguments',
+};
+
+function normalizeThoughtName(type: ThoughtEntityType, row: any): string {
+  return type === 'claim' ? String(row.statement || '').trim() : String(row.name || '').trim();
+}
+
+function normalizeThoughtRow(type: ThoughtEntityType, row: any): ThoughtEntitySummary {
+  return {
+    id: row.id,
+    entity_type: type,
+    name: normalizeThoughtName(type, row),
+    summary: String(row.summary || row.description || row.source_note || '').trim(),
+    aliases: Array.isArray(row.aliases) ? row.aliases : [],
+    updated_at: row.updated_at || row.created_at,
+  };
+}
+
+export async function getThoughtEntities(params?: {
+  type?: ThoughtEntityType;
+  keyword?: string;
+  limit?: number;
+}): Promise<ThoughtEntitySummary[]> {
+  const types = params?.type ? [params.type] : (Object.keys(THOUGHT_TABLE) as ThoughtEntityType[]);
+  const limit = Math.min(Math.max(params?.limit || 200, 1), 500);
+  const keyword = params?.keyword?.trim().toLowerCase();
+  const results = await Promise.all(types.map(async (type) => {
+    const { data, error } = await supabase.from(THOUGHT_TABLE[type]).select('*').order('updated_at', { ascending: false }).limit(limit);
+    if (error) return [] as ThoughtEntitySummary[];
+    return (data || []).map((row: any) => normalizeThoughtRow(type, row));
+  }));
+  const merged = results.flat();
+  if (!keyword) return merged.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  return merged.filter((item) => `${item.name} ${item.summary} ${item.aliases.join(' ')}`.toLowerCase().includes(keyword));
+}
+
+export async function createThoughtEntity(type: ThoughtEntityType, payload: Record<string, any>): Promise<any | null> {
+  const table = THOUGHT_TABLE[type];
+  const clean = { ...payload };
+  if (type === 'claim') {
+    clean.statement = String(payload.statement || '').trim();
+    delete clean.name;
+  } else {
+    clean.name = String(payload.name || '').trim();
+  }
+  if (type !== 'claim' && !clean.name) return null;
+  if (type === 'claim' && !clean.statement) return null;
+  const { data: { user } } = await supabase.auth.getUser();
+  const { data, error } = await supabase.from(table).insert({ ...clean, created_by: user?.id || null }).select().single();
+  if (error) return null;
+  triggerAutoBackupDebounced();
+  return data;
+}
+
+export async function updateThoughtEntity(type: ThoughtEntityType, id: string, payload: Record<string, any>): Promise<any | null> {
+  const { data, error } = await supabase.from(THOUGHT_TABLE[type]).update(payload).eq('id', id).select().single();
+  if (error) return null;
+  triggerAutoBackupDebounced();
+  return data;
+}
+
+export async function deleteThoughtEntity(type: ThoughtEntityType, id: string): Promise<boolean> {
+  const { error } = await supabase.from(THOUGHT_TABLE[type]).delete().eq('id', id);
+  if (!error) triggerAutoBackupDebounced();
+  return !error;
+}
+
+export async function getJournalEntities(journalId: string): Promise<JournalEntityLink[]> {
+  const { data, error } = await supabase.from('journal_entities').select('*').eq('journal_id', journalId).order('sort_order', { ascending: true });
+  if (error || !data) return [];
+  const links = data as JournalEntityLink[];
+  const enriched = await Promise.all(links.map(async (link) => {
+    const { data: entity } = await supabase.from(THOUGHT_TABLE[link.entity_type]).select('*').eq('id', link.entity_id).maybeSingle();
+    return { ...link, entity: entity ? { ...entity, name: normalizeThoughtName(link.entity_type, entity) } : undefined };
+  }));
+  return enriched;
+}
+
+export async function linkThoughtToJournal(payload: {
+  journal_id: string;
+  entity_type: ThoughtEntityType;
+  entity_id: string;
+  role?: ThoughtJournalRole;
+  mention?: string;
+  note?: string;
+  sort_order?: number;
+}): Promise<JournalEntityLink | null> {
+  const { data: { user } } = await supabase.auth.getUser();
+  const { data, error } = await supabase.from('journal_entities').upsert({
+    ...payload,
+    role: payload.role || 'mentioned',
+    mention: payload.mention || '',
+    note: payload.note || '',
+    sort_order: payload.sort_order || 0,
+    created_by: user?.id || null,
+  }, { onConflict: 'journal_id,entity_type,entity_id' }).select().single();
+  if (error) return null;
+  triggerAutoBackupDebounced();
+  return data as JournalEntityLink;
+}
+
+export async function unlinkThoughtFromJournal(linkId: string): Promise<boolean> {
+  const { error } = await supabase.from('journal_entities').delete().eq('id', linkId);
+  if (!error) triggerAutoBackupDebounced();
+  return !error;
+}
+
+export async function getThoughtRelations(params?: { entityType?: ThoughtEntityType; entityId?: string; journalId?: string }): Promise<JournalRelation[]> {
+  let query = supabase.from('journal_relations').select('*').order('created_at', { ascending: false });
+  if (params?.entityType && params?.entityId) {
+    query = query.or(`and(source_type.eq.${params.entityType},source_id.eq.${params.entityId}),and(target_type.eq.${params.entityType},target_id.eq.${params.entityId})`);
+  }
+  if (params?.journalId) query = query.eq('journal_id', params.journalId);
+  const { data, error } = await query;
+  if (error || !data) return [];
+  return data as JournalRelation[];
+}
+
+export async function createThoughtRelation(payload: {
+  journal_id?: string;
+  source_type: ThoughtEntityType;
+  source_id: string;
+  target_type: ThoughtEntityType;
+  target_id: string;
+  relation_type: string;
+  weight?: number;
+  note?: string;
+}): Promise<JournalRelation | null> {
+  const { data: { user } } = await supabase.auth.getUser();
+  const { data, error } = await supabase.from('journal_relations').insert({
+    ...payload,
+    relation_type: payload.relation_type.trim(),
+    note: payload.note || '',
+    created_by: user?.id || null,
+  }).select().single();
+  if (error) return null;
+  triggerAutoBackupDebounced();
+  return data as JournalRelation;
+}
+
+export async function deleteThoughtRelation(id: string): Promise<boolean> {
+  const { error } = await supabase.from('journal_relations').delete().eq('id', id);
+  if (!error) triggerAutoBackupDebounced();
+  return !error;
+}
+
+export async function getThoughtDatabaseStats(): Promise<Record<string, number>> {
+  const { data, error } = await supabase.rpc('get_thought_database_stats');
+  if (error || !data) return {};
+  return data as Record<string, number>;
+}
