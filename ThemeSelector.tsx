@@ -13,7 +13,6 @@ export const ThemeSelector: React.FC = () => {
     { key: 'green_forest', name: '绿色森林', preview: '#EEF6F2', isDark: false },
     { key: 'sunset', name: '渐变晚霞', preview: '#FAF0ED', isDark: false },
     { key: 'dark_minimal', name: '暗黑极简', preview: '#181A1F', isDark: true },
-    { key: 'system', name: '跟随系统', preview: '#E2E4E8', isDark: false },
   ];
 
   return (

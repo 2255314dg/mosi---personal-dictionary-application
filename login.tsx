@@ -33,10 +33,8 @@ import {
   checkPasswordStrength,
   checkBiometricSupport,
   authenticateWithBiometrics,
-  getBiometricEnabled,
-  setBiometricEnabled,
-  getBiometricCredentials,
 } from '@/utils/security';
+import { friendlyErrorMessage } from '@/utils/errors';
 
 export default function LoginScreen() {
   const router = useRouter();
@@ -55,8 +53,6 @@ export default function LoginScreen() {
   // 生物识别相关状态
   const [biometricAvailable, setBiometricAvailable] = useState(false);
   const [biometricType, setBiometricType] = useState('指纹/面容');
-  const [showBiometricPromptModal, setShowBiometricPromptModal] = useState(false);
-  const [rememberedUser, setRememberedUser] = useState<string>('');
 
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
@@ -73,12 +69,7 @@ export default function LoginScreen() {
         setBiometricAvailable(true);
         setBiometricType(support.biometryType);
 
-        // 检查是否有已开启的生物识别
-        const enabled = await getBiometricEnabled();
-        const creds = await getBiometricCredentials();
-        if (enabled && creds?.username) {
-          setRememberedUser(creds.username);
-        }
+        // 生物识别只作为本机解锁门槛，不保存 Supabase 密码。
       }
     })();
   }, []);
@@ -86,26 +77,15 @@ export default function LoginScreen() {
   // 生物识别快捷登录
   const handleBiometricLogin = async () => {
     try {
-      const creds = await getBiometricCredentials();
-      if (!creds || !creds.username) {
-        setErrorMsg('请先使用账号密码正常登录一次，并开启生物识别');
-        return;
-      }
-
       const success = await authenticateWithBiometrics(`使用${biometricType}验证身份进入墨思`);
       if (success) {
         setLoading(true);
         setErrorMsg('');
         setSuccessMsg(`${biometricType}验证成功，正在登录...`);
 
-        // 使用记住的凭据免密登录
-        const email = creds.username.includes('@') ? creds.username.trim() : `${creds.username.trim().toLowerCase()}@mosi.local`;
-        if (creds.password) {
-          const { error } = await supabase.auth.signInWithPassword({
-            email,
-            password: creds.password,
-          });
-          if (error) throw error;
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (!sessionData.session) {
+          throw new Error('当前没有可解锁的登录会话，请使用账号密码登录一次');
         }
 
         setTimeout(() => {
@@ -114,7 +94,7 @@ export default function LoginScreen() {
       }
     } catch (err: any) {
       console.error(err);
-      setErrorMsg(err.message || '生物识别验证失败，请使用密码登录');
+      setErrorMsg(friendlyErrorMessage(err, '生物识别验证失败，请使用密码登录'));
     } finally {
       setLoading(false);
     }
@@ -163,29 +143,34 @@ export default function LoginScreen() {
         });
         if (error) throw error;
 
-        // 创建 profile 记录（包含安全问题）
         if (data.user) {
-          const role = username.toLowerCase().includes('admin') ? 'admin' : 'user';
-          await supabase.from('profiles').insert({
+          // 注册用户永远从普通 user 开始；管理员角色必须由数据库侧授予。
+          const { error: profileError } = await supabase.from('profiles').insert({
             id: data.user.id,
             username: username.trim(),
             nickname: username.trim(),
-            role,
-            security_question: securityQuestion,
-            security_answer: securityAnswer.trim() || null,
+            role: 'user',
           });
+          if (profileError) throw profileError;
 
-          // 如果填写了邀请码，核销该邀请码
+          if (!data.session) {
+            throw new Error('注册成功，但当前 Supabase 启用了邮箱确认。请完成邮箱确认后重新登录；邀请码将在登录后由管理员流程处理。');
+          }
+
+          if (securityQuestion.trim() && securityAnswer.trim()) {
+            const { error: securityError } = await supabase.rpc('set_security_answer', {
+              p_question: securityQuestion.trim(),
+              p_answer: securityAnswer.trim(),
+            });
+            if (securityError) throw securityError;
+          }
+
           if (requireCode && invitationCode.trim()) {
-            await consumeInvitationCode(invitationCode.trim(), data.user.id);
+            const consumed = await consumeInvitationCode(invitationCode.trim(), data.user.id);
+            if (!consumed) throw new Error('邀请码核销失败，请勿重复注册，请联系管理员');
           }
         }
         setSuccessMsg('注册成功，正在进入墨思...');
-
-        // 检查是否支持生物识别，询问开启
-        if (biometricAvailable) {
-          await setBiometricEnabled(true, { username: username.trim(), password: password.trim() });
-        }
 
         setTimeout(() => {
           router.replace('/');
@@ -197,21 +182,7 @@ export default function LoginScreen() {
         });
         if (error) throw error;
 
-        // 如果是系统管理员账号或包含 admin
-        if (username.toLowerCase().includes('admin') && data.user) {
-          await supabase.from('profiles').upsert({
-            id: data.user.id,
-            username: username.trim(),
-            nickname: '墨思创作者',
-            role: 'admin',
-          });
-        }
-
-        // 保存凭据供下次生物识别快速登录
-        if (biometricAvailable) {
-          await setBiometricEnabled(true, { username: username.trim(), password: password.trim() });
-        }
-
+        await supabase.rpc('write_audit_event', { p_action:'LOGIN_SUCCESS', p_entity_type:'auth', p_entity_id:data.user?.id || null, p_severity:'info', p_metadata:{ method:'password' } });
         setSuccessMsg('认证成功，欢迎回归墨思');
         setTimeout(() => {
           router.replace('/');
@@ -219,7 +190,7 @@ export default function LoginScreen() {
       }
     } catch (err: any) {
       console.error(err);
-      setErrorMsg(err.message || '认证失败，请检查账号密码');
+      setErrorMsg(friendlyErrorMessage(err, '认证失败，请检查账号密码'));
     } finally {
       setLoading(false);
     }
@@ -423,7 +394,7 @@ export default function LoginScreen() {
               >
                 <Fingerprint size={18} color={colors.accent} />
                 <Text className="text-xs font-semibold ml-2" style={{ color: colors.textPrimary }}>
-                  {rememberedUser ? `使用${biometricType}快捷登录 (${rememberedUser})` : `使用${biometricType}快捷登录`}
+                  使用{biometricType}解锁当前会话
                 </Text>
               </Pressable>
             )}
@@ -446,7 +417,7 @@ export default function LoginScreen() {
                 墨思为私人空间，需邀请码方可访问
               </Text>
               <Text className="text-[10px] leading-relaxed mt-1 text-center" style={{ color: colors.textMuted }}>
-                输入用户名包含 admin (如 admin / admin123) 登录或注册即可拥有创作者管理权限。
+                管理员权限由服务端角色控制；普通注册用户不会因用户名包含 admin 而获得管理权限。
               </Text>
             </View>
           </View>

@@ -5,6 +5,7 @@ import { useTheme } from '@/context/ThemeContext';
 import { StyledUnderlineSvg, UnderlineStyleType } from './StyledUnderlineSvg';
 import { AdaptiveMarkdownImage } from './AdaptiveMarkdownImage';
 import { MessageSquareQuote, Code } from 'lucide-react-native';
+import { LatexView } from './LatexView';
 
 interface MarkdownRendererProps {
   content: string;
@@ -77,45 +78,46 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content }) =
       continue;
     }
 
-    // 1. 标题 H1 / H2 / H3
-    if (trimmed.startsWith('# ')) {
-      elements.push(
-        <Text
-          key={`h1-${i}`}
-          className="text-2xl font-bold my-3 tracking-wide"
-          style={{ color: colors.textPrimary }}
-        >
-          {trimmed.replace(/^#\s+/, '')}
-        </Text>
-      );
-      i++;
+    // 1. LaTeX 块：支持 \[...\]、$$...$$ 与单行 \(...\)
+    if (trimmed.startsWith('\\[') || trimmed.startsWith('$$')) {
+      const start = trimmed.startsWith('\\[') ? '\\[' : '$$';
+      const end = start === '\\[' ? '\\]' : '$$';
+      const formulaLines: string[] = [];
+      let current = trimmed.replace(start, '');
+      if (!current.includes(end)) {
+        i++;
+        while (i < lines.length && !lines[i].includes(end)) { formulaLines.push(lines[i]); i++; }
+        if (i < lines.length) { formulaLines.push(lines[i].split(end)[0]); i++; }
+      } else {
+        formulaLines.push(current.split(end)[0]);
+        i++;
+      }
+      elements.push(<LatexView key={`math-${i}`} latex={formulaLines.join('\n')} display />);
       continue;
     }
-    if (trimmed.startsWith('## ')) {
+
+    // 2. 标题 H1-H7：正文完整支持，阅读目录由 H1/H2/H3... 统一生成
+    const heading = trimmed.match(/^(#{1,7})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      const title = heading[2];
+      const sizes: Record<number, number> = {1:24,2:20,3:17,4:15,5:14,6:13,7:12};
       elements.push(
-        <View key={`h2-${i}`} className="mt-5 mb-2.5">
-          <Text
-            className="text-xl font-bold tracking-wide"
-            style={{ color: colors.textPrimary }}
-          >
-            {trimmed.replace(/^##\s+/, '')}
+        <View key={`h${level}-${i}`} style={{ marginTop: level <= 2 ? 20 : 12, marginBottom: 7, paddingLeft: Math.max(0, level-2)*8 }}>
+          <Text style={{ color: level <= 3 ? colors.textPrimary : colors.textSecondary, fontSize:sizes[level], fontWeight: level <= 3 ? '800' : '700', lineHeight:sizes[level]+7 }}>
+            {title}
           </Text>
-          <View className="h-0.5 w-10 mt-1.5 rounded-full" style={{ backgroundColor: colors.accent }} />
+          {level === 1 || level === 2 ? <View style={{ width:level===1?54:38, height:2, marginTop:5, borderRadius:2, backgroundColor:colors.accent }} /> : null}
         </View>
       );
       i++;
       continue;
     }
-    if (trimmed.startsWith('### ')) {
-      elements.push(
-        <Text
-          key={`h3-${i}`}
-          className="text-base font-bold mt-4 mb-1.5"
-          style={{ color: colors.accent }}
-        >
-          {trimmed.replace(/^###\s+/, '')}
-        </Text>
-      );
+
+    // 3. 单行行内数学公式
+    if ((/^\\\(.+\\\)$/.test(trimmed)) || (/^\$\$.+\$\$$/.test(trimmed))) {
+      const formula = trimmed.startsWith('\\(') ? trimmed.slice(2,-2) : trimmed.slice(2,-2);
+      elements.push(<LatexView key={`inline-math-${i}`} latex={formula} display={false} />);
       i++;
       continue;
     }
@@ -139,7 +141,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content }) =
           <View className="flex-row items-center mb-1">
             <MessageSquareQuote size={16} color={colors.accent} />
             <Text className="text-[11px] font-semibold ml-1.5 tracking-wider" style={{ color: colors.accent }}>
-              沉思对谈
+              思辨引用
             </Text>
           </View>
           {quoteLines.map((ql, qIdx) => (
@@ -286,9 +288,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content }) =
     // 6. 普通段落 (支持内嵌7种下划线语法，例如: ~u[text]{wavy}~ 或 粗体 **text**、代码 `code`)
     elements.push(
       <View key={`p-${i}`} className="my-1.5">
-        <Text className="text-base leading-relaxed text-justify" style={{ color: colors.textPrimary }}>
-          {renderInlineStyles(trimmed, colors)}
-        </Text>
+        <View className="flex-row flex-wrap items-center">{renderParagraphWithMath(trimmed, colors)}</View>
       </View>
     );
 
@@ -298,10 +298,22 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content }) =
   return <View className="py-2">{elements}</View>;
 };
 
+function renderParagraphWithMath(text: string, colors:any): React.ReactNode[] {
+  const parts = text.split(/(\\\([^)]*?\\\)|\$[^$]+\$)/g);
+  return parts.map((part, idx) => {
+    if (!part) return null as any;
+    if ((part.startsWith('\\(') && part.endsWith('\\)')) || (part.startsWith('$') && part.endsWith('$'))) {
+      const formula = part.startsWith('\\(') ? part.slice(2,-2) : part.slice(1,-1);
+      return <LatexView key={`pm-${idx}`} latex={formula} display={false} />;
+    }
+    return <Text key={`pt-${idx}`} style={{color:colors.textPrimary}}>{renderInlineStyles(part, colors)}</Text>;
+  }).filter(Boolean) as React.ReactNode[];
+}
+
 // 内联样式解析辅助器 (处理超链接、粗体、斜体、行内代码、7种下划线标记)
 function renderInlineStyles(text: string, colors: any): React.ReactNode {
   // 正则检测超链接 [text](url)、特殊下划线标记: ~u[内容]{lineType}~、粗体 **text**、斜体 *text*、代码 `code`
-  const parts = text.split(/(\[.*?\]\(.*?\)|\~u\[.*?\]\{.*?\}~|\*\*.*?\*\*|\*.*?\*|`.*?`)/g);
+  const parts = text.split(/(\[.*?\]\(.*?\)|<span data-mosi-color=\".*?\"(?: data-mosi-font=\".*?\")?>.*?<\/span>|\~u\[.*?\]\{.*?\}~|\*\*.*?\*\*|\*.*?\*|`.*?`)/g);
 
   return parts.map((part, idx) => {
     if (!part) return null;
@@ -327,6 +339,12 @@ function renderInlineStyles(text: string, colors: any): React.ReactNode {
           {linkText}
         </Text>
       );
+    }
+
+    // 墨思字体/颜色标记：保持 Markdown 为唯一正文源
+    const styledMatch = part.match(/^<span data-mosi-color=\"(#[0-9A-Fa-f]{6})\"(?: data-mosi-font=\"([^\"]+)\")?>([\s\S]*?)<\/span>$/);
+    if (styledMatch) {
+      return <Text key={idx} style={{ color: styledMatch[1], fontFamily: styledMatch[2] || undefined }}>{styledMatch[3]}</Text>;
     }
 
     // 7种下划线标记

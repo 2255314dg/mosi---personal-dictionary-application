@@ -16,6 +16,9 @@ import { Paths, File } from 'expo-file-system';
 import JSZip from 'jszip';
 import { useTheme } from '@/context/ThemeContext';
 import { useAudioPlayer } from '@/context/AudioPlayerContext';
+import { PinKeypadModal } from '@/components/PinKeypadModal';
+import { GesturePatternModal } from '@/components/GesturePatternModal';
+import { savePinCode, getPin, saveGesturePattern, getGesturePattern, clearGesturePattern } from '@/utils/security';
 import { supabase } from '@/client/supabase';
 import {
   Journal,
@@ -23,6 +26,8 @@ import {
   InvitationCode,
   TagItem,
   getJournals,
+  deleteJournal,
+  checkIsAdmin,
   getAllComments,
   deleteComment,
   getJournalDisplayTitle,
@@ -33,6 +38,8 @@ import {
   getRequireInvitationCodeSetting,
   updateRequireInvitationCodeSetting,
   updateAdminPassword,
+  getSecurityPolicyDB, setSecurityPolicyDB, getDeviceRegistry, setDeviceApproval, getAuditLogs,
+  DeviceRegistryItem, AuditLogItem,
   uploadMusicFile,
   addMusicTrackDB,
   getTagCatalogDB,
@@ -78,6 +85,7 @@ import {
   clearLocalBackup,
   formatBytes,
   BackupMetaInfo,
+  startAutomaticBackupLoop,
 } from '@/utils/backup';
 
 export default function AdminScreen() {
@@ -93,6 +101,14 @@ export default function AdminScreen() {
   const [requireCodeSetting, setRequireCodeSetting] = useState(true);
   const [selectedJournalIds, setSelectedJournalIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
+  const [securityPolicy, setSecurityPolicy] = useState<any>(null);
+  const [devices, setDevices] = useState<DeviceRegistryItem[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [pinSetupVisible, setPinSetupVisible] = useState(false);
+  const [gestureSetupVisible, setGestureSetupVisible] = useState(false);
+  const [pinConfigured, setPinConfigured] = useState(false);
+  const [gestureConfigured, setGestureConfigured] = useState(false);
 
   // 本地备份与恢复状态
   const [backupMeta, setBackupMeta] = useState<BackupMetaInfo | null>(null);
@@ -110,6 +126,25 @@ export default function AdminScreen() {
   const [newTagEmoji, setNewTagEmoji] = useState('');
   const [tagAdding, setTagAdding] = useState(false);
   const [tagMsg, setTagMsg] = useState('');
+
+  useEffect(() => {
+    if (activeTab !== 'security') return;
+    (async () => {
+      setAuditLoading(true);
+      const [policy, deviceList, logs] = await Promise.all([getSecurityPolicyDB(), getDeviceRegistry(), getAuditLogs(300)]);
+      setSecurityPolicy(policy);
+      setDevices(deviceList);
+      setAuditLogs(logs);
+      setPinConfigured(Boolean(await getPin()));
+      setGestureConfigured(Boolean(await getGesturePattern()));
+      setAuditLoading(false);
+    })();
+  }, [activeTab]);
+
+  const toggleSecuritySetting = async (key: string, value: boolean | number) => {
+    const ok = await setSecurityPolicyDB(key as any, value);
+    if (ok) { setSecurityPolicy((prev:any)=>({ ...prev, [key]: value })); if (key === 'local_backup_interval_seconds') await startAutomaticBackupLoop(); }
+  };
 
   // 快捷 emoji 候选列表
   const QUICK_EMOJIS = ['💭', '⏳', '🌌', '🌱', '⚡', '🎨', '❤️', '🌊', '🌀', '🕊️', '🌧️', '🕯️', '✨', '☀️', '⛅', '❄️', '💨'];
@@ -159,7 +194,14 @@ export default function AdminScreen() {
   const [exportSuccess, setExportSuccess] = useState(false);
 
   useEffect(() => {
-    loadAllData();
+    (async () => {
+      const allowed = await checkIsAdmin();
+      if (!allowed) {
+        router.replace('/' as any);
+        return;
+      }
+      await loadAllData();
+    })();
   }, []);
 
   const loadAllData = async () => {
@@ -618,7 +660,10 @@ export default function AdminScreen() {
       try {
         const file = new File(Paths.document, `mosi_journals_export_${Date.now()}.zip`);
         file.create({ overwrite: true });
-        file.write(base64Data);
+        const binary = globalThis.atob(base64Data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        file.write(bytes);
 
         if (await Sharing.isAvailableAsync()) {
           await Sharing.shareAsync(file.uri, {
@@ -1367,6 +1412,37 @@ export default function AdminScreen() {
                 </Pressable>
               </View>
 
+              {/* MOSI 安全策略：PIN/手势由管理员统一控制 */}
+              <View className="p-5 rounded-3xl border shadow-sm mb-4" style={{backgroundColor:colors.cardBg,borderColor:colors.cardBorder}}>
+                <Text className="text-base font-bold mb-1" style={{color:colors.textPrimary}}>应用安全策略</Text>
+                <Text className="text-xs mb-4" style={{color:colors.textMuted}}>所有开关在数据库服务端保存；普通用户端不再拥有修改权限。</Text>
+                {[
+                  ['security_pin_enabled','PIN 码保护'],
+                  ['security_gesture_enabled','手势密码保护'],
+                  ['device_allowlist_enabled','设备授权白名单'],
+                ].map(([key,label])=><View key={key} className="flex-row items-center justify-between py-3 border-b" style={{borderColor:colors.cardBorder}}><View className="flex-1 mr-3"><Text className="text-sm font-semibold" style={{color:colors.textPrimary}}>{label}</Text><Text className="text-[11px] mt-1" style={{color:colors.textMuted}}>{key==='device_allowlist_enabled'?'关闭后所有已登录设备可访问私人数据；建议保持开启。':'由管理员决定应用是否强制执行。'}</Text></View><Switch value={Boolean(securityPolicy?.[key])} onValueChange={(v)=>toggleSecuritySetting(key,v)} trackColor={{false:colors.cardBorder,true:colors.accentBg}} thumbColor={Boolean(securityPolicy?.[key])?colors.accent:colors.textMuted}/></View>)}
+                <View className="mt-4 flex-row gap-2">
+                  <Pressable onPress={()=>setPinSetupVisible(true)} className="flex-1 py-2.5 rounded-xl border items-center" style={{borderColor:colors.cardBorder,backgroundColor:colors.bg}}><Text className="text-xs font-bold" style={{color:colors.textPrimary}}>{pinConfigured?'重设 PIN':'设置 PIN'}</Text></Pressable>
+                  <Pressable onPress={()=>setGestureSetupVisible(true)} className="flex-1 py-2.5 rounded-xl border items-center" style={{borderColor:colors.cardBorder,backgroundColor:colors.bg}}><Text className="text-xs font-bold" style={{color:colors.textPrimary}}>{gestureConfigured?'重设手势':'设置手势'}</Text></Pressable>
+                  {gestureConfigured ? <Pressable onPress={async()=>{await clearGesturePattern();setGestureConfigured(false)}} className="px-3 py-2.5 rounded-xl border items-center" style={{borderColor:'#FCA5A5',backgroundColor:'#FEF2F2'}}><Text className="text-xs font-bold text-red-600">清除手势</Text></Pressable> : null}
+                </View>
+                <View className="pt-4 flex-row gap-3"><View className="flex-1"><Text className="text-xs font-semibold mb-1" style={{color:colors.textSecondary}}>自动保存（秒，最低30）</Text><TextInput keyboardType="numeric" value={String(securityPolicy?.autosave_interval_seconds ?? 30)} onChangeText={v=>setSecurityPolicy((p:any)=>({...p,autosave_interval_seconds:Number(v)||30}))} onBlur={()=>toggleSecuritySetting('autosave_interval_seconds',Math.max(30,Number(securityPolicy?.autosave_interval_seconds)||30))} className="p-2.5 rounded-xl border text-xs" style={{backgroundColor:colors.bg,borderColor:colors.cardBorder,color:colors.textPrimary}}/></View><View className="flex-1"><Text className="text-xs font-semibold mb-1" style={{color:colors.textSecondary}}>自动备份（秒，最低60）</Text><TextInput keyboardType="numeric" value={String(securityPolicy?.local_backup_interval_seconds ?? 60)} onChangeText={v=>setSecurityPolicy((p:any)=>({...p,local_backup_interval_seconds:Number(v)||60}))} onBlur={()=>toggleSecuritySetting('local_backup_interval_seconds',Math.max(60,Number(securityPolicy?.local_backup_interval_seconds)||60))} className="p-2.5 rounded-xl border text-xs" style={{backgroundColor:colors.bg,borderColor:colors.cardBorder,color:colors.textPrimary}}/></View></View>
+              </View>
+
+              {/* 设备白名单 */}
+              <View className="p-5 rounded-3xl border shadow-sm mb-4" style={{backgroundColor:colors.cardBg,borderColor:colors.cardBorder}}>
+                <Text className="text-base font-bold" style={{color:colors.textPrimary}}>设备授权管理</Text>
+                <Text className="text-xs mt-1 mb-3" style={{color:colors.textMuted}}>只允许你手动批准的设备进入私人数据库。IP 不是稳定的唯一身份，因此不作为唯一安全依据。</Text>
+                {devices.map(d=><View key={d.id} className="py-3 border-b" style={{borderColor:colors.cardBorder}}><View className="flex-row items-center justify-between"><View className="flex-1 mr-3"><Text className="text-xs font-bold" style={{color:colors.textPrimary}}>{d.device_name}</Text><Text className="text-[10px] mt-1" style={{color:colors.textMuted}}>{d.platform} · {d.device_id.slice(0,8)}… · {d.approved?'已授权':'待授权'}</Text></View><Pressable onPress={async()=>{const ok=await setDeviceApproval(d.id,!d.approved);if(ok)setDevices(prev=>prev.map(x=>x.id===d.id?{...x,approved:!d.approved}:x));}} className="px-3 py-1.5 rounded-xl border" style={{backgroundColor:d.approved?'#FEF2F2':colors.accentBg,borderColor:d.approved?'#EF4444':colors.accent}}><Text className="text-[11px] font-bold" style={{color:d.approved?'#DC2626':colors.accent}}>{d.approved?'撤销授权':'批准设备'}</Text></Pressable></View></View>)}
+                {!devices.length?<Text className="text-xs py-3" style={{color:colors.textMuted}}>暂无设备登记。</Text>:null}
+              </View>
+
+              {/* 完整审计日志 */}
+              <View className="p-5 rounded-3xl border shadow-sm mb-4" style={{backgroundColor:colors.cardBg,borderColor:colors.cardBorder}}>
+                <View className="flex-row items-center justify-between mb-3"><View><Text className="text-base font-bold" style={{color:colors.textPrimary}}>安全审计日志</Text><Text className="text-xs mt-1" style={{color:colors.textMuted}}>数据库触发器记录数据增删改、设备授权、分享链接和设置变更。</Text></View><Pressable onPress={async()=>setAuditLogs(await getAuditLogs(300))} className="px-3 py-1.5 rounded-xl border" style={{borderColor:colors.cardBorder}}><Text className="text-[11px] font-bold" style={{color:colors.accent}}>刷新</Text></Pressable></View>
+                {auditLoading?<ActivityIndicator color={colors.accent}/>:auditLogs.slice(0,80).map(log=><View key={String(log.id)} className="py-2.5 border-b" style={{borderColor:colors.cardBorder}}><View className="flex-row justify-between"><Text className="text-xs font-bold" style={{color:log.severity==='critical'?'#DC2626':log.severity==='warning'?'#D97706':colors.textPrimary}}>{log.action} · {log.entity_type}</Text><Text className="text-[10px]" style={{color:colors.textMuted}}>{new Date(log.created_at).toLocaleString()}</Text></View><Text className="text-[10px] mt-1" numberOfLines={2} style={{color:colors.textMuted}}>ID: {log.entity_id || '-'} · 设备: {log.actor_device_id ? log.actor_device_id.slice(0,8)+'…' : '未知'}</Text></View>)}
+              </View>
+
               {/* 初始密码与安全提示小卡片 */}
               <View
                 className="p-4 rounded-2xl border bg-black/5 mb-4"
@@ -1376,7 +1452,7 @@ export default function AdminScreen() {
                   安全指引：
                 </Text>
                 <Text className="text-[11px] leading-relaxed" style={{ color: colors.textMuted }}>
-                  • 系统管理员默认初始密码为：J7#kQ9zLp2{'\n'}
+                  • 系统管理员初始密码只应通过安全渠道设置；源码与界面不再展示默认密码。{'\n'}
                   • 修改密码成功后，系统将自动退出当前会话并跳转至登录页，请妥善保管新密码。
                 </Text>
               </View>
@@ -1828,11 +1904,10 @@ export default function AdminScreen() {
                         </Text>
                       </View>
 
-                      {isChecked ? (
-                        <CheckSquare size={18} color={colors.accent} />
-                      ) : (
-                        <Square size={18} color={colors.textMuted} />
-                      )}
+                      <View className="flex-row items-center gap-2">
+                        {isChecked ? <CheckSquare size={18} color={colors.accent} /> : <Square size={18} color={colors.textMuted} />}
+                        <Pressable onPress={()=>{setConfirmModalTitle('删除思辨日志');setConfirmModalMessage(`确认删除《${getJournalDisplayTitle(j)}》？此操作会通过统一删除入口同步清理版本历史与相关分享链接。`);setConfirmModalAction(()=>async()=>{const ok=await deleteJournal(j.id);if(ok)setJournals(prev=>prev.filter(x=>x.id!==j.id));});setConfirmModalVisible(true);}} className="p-2 rounded-lg" style={{backgroundColor:'#FEF2F2'}}><Trash2 size={15} color="#DC2626"/></Pressable>
+                      </View>
                     </Pressable>
                   );
                 })}

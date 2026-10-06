@@ -28,6 +28,7 @@ import {
   getBiometricEnabled,
   setBiometricEnabled,
   checkBiometricSupport,
+  authenticateWithBiometrics,
 } from '@/utils/security';
 import { clearAllLocalData } from '@/utils/backup';
 import { PinKeypadModal } from '@/components/PinKeypadModal';
@@ -80,7 +81,6 @@ export default function ProfileScreen() {
 
   // 安全设置状态
   const [pinEnabled, setPinEnabled] = useState(false);
-  const [currentPin, setCurrentPin] = useState<string | null>(null);
   const [showPinSetupModal, setShowPinSetupModal] = useState(false);
   const [biometricEnabled, setBiometricEnabledState] = useState(false);
   const [biometricAvailable, setBiometricAvailable] = useState(false);
@@ -105,7 +105,7 @@ export default function ProfileScreen() {
         setBio(res.profile.bio || '');
         setAvatarUrl(res.profile.avatar_url || DEFAULT_AVATARS[0]);
         setSecurityQuestion(res.profile.security_question || '我最喜欢的哲学书籍');
-        setSecurityAnswer(res.profile.security_answer || '');
+        setSecurityAnswer('');
       }
       setJournalsCount(res.journalsCount);
       setCommentsCount(res.commentsCount);
@@ -113,7 +113,6 @@ export default function ProfileScreen() {
       // 安全配置
       const pStatus = await getPinStatus();
       setPinEnabled(pStatus.enabled);
-      setCurrentPin(pStatus.pin);
 
       const bSupport = await checkBiometricSupport();
       setBiometricAvailable(bSupport.supported && bSupport.enrolled);
@@ -197,7 +196,7 @@ export default function ProfileScreen() {
     if (pinEnabled) {
       await disablePinCode();
       setPinEnabled(false);
-      setCurrentPin(null);
+      /* PIN is stored in SecureStore */ 
       setStatusMsg({ type: 'success', text: '已停用 PIN 码安全保护' });
     } else {
       setShowPinSetupModal(true);
@@ -207,11 +206,18 @@ export default function ProfileScreen() {
   // 切换生物识别
   const handleToggleBiometric = async () => {
     const nextState = !biometricEnabled;
+    if (nextState) {
+      const verified = await authenticateWithBiometrics(`确认开启${biometryType}保护`);
+      if (!verified) {
+        setStatusMsg({ type: 'error', text: '未完成生物识别验证，未开启保护' });
+        return;
+      }
+    }
     await setBiometricEnabled(nextState);
     setBiometricEnabledState(nextState);
     setStatusMsg({
       type: 'success',
-      text: nextState ? `已开启${biometryType}快捷登录` : `已关闭${biometryType}快捷登录`,
+      text: nextState ? `已开启${biometryType}保护（不保存账号密码）` : `已关闭${biometryType}保护`,
     });
   };
 
@@ -235,7 +241,7 @@ export default function ProfileScreen() {
     }
   };
 
-  const isAdmin = profile?.role === 'admin' || session?.user?.email?.includes('admin');
+  const isAdmin = profile?.role === 'admin';
 
   return (
     <SafeAreaView edges={['top']} className="flex-1" style={{ backgroundColor: colors.bg }}>
@@ -521,38 +527,15 @@ export default function ProfileScreen() {
             </View>
 
             <View className="gap-3">
-              {/* PIN 码保护 */}
-              <View
-                className="p-3.5 rounded-2xl border flex-row items-center justify-between"
-                style={{ backgroundColor: colors.bg, borderColor: colors.cardBorder }}
-              >
-                <View className="flex-1 mr-3">
-                  <View className="flex-row items-center">
-                    <Key size={14} color={colors.accent} />
-                    <Text className="text-xs font-bold ml-1.5" style={{ color: colors.textPrimary }}>
-                      4-6 位数字 PIN 码保护
-                    </Text>
-                  </View>
-                  <Text className="text-[11px] mt-1" style={{ color: colors.textMuted }}>
-                    {pinEnabled ? '已启用：切后台重回时需验证 PIN 码' : '未开启：建议启用以防他人翻阅思辨日记'}
-                  </Text>
+              {/* PIN / 手势由管理员统一控制，普通用户不可在此开启或关闭 */}
+              <View className="p-3.5 rounded-2xl border" style={{ backgroundColor: colors.bg, borderColor: colors.cardBorder }}>
+                <View className="flex-row items-center">
+                  <Key size={14} color={colors.accent} />
+                  <Text className="text-xs font-bold ml-1.5" style={{ color: colors.textPrimary }}>应用 PIN / 手势密码</Text>
                 </View>
-
-                <Pressable
-                  onPress={handleTogglePin}
-                  className="px-3 py-1.5 rounded-xl border active:opacity-75"
-                  style={{
-                    backgroundColor: pinEnabled ? '#FEE2E2' : colors.accentBg,
-                    borderColor: pinEnabled ? '#EF4444' : colors.accent,
-                  }}
-                >
-                  <Text
-                    className="text-xs font-bold"
-                    style={{ color: pinEnabled ? '#DC2626' : colors.accent }}
-                  >
-                    {pinEnabled ? '停用' : '启用'}
-                  </Text>
-                </Pressable>
+                <Text className="text-[11px] mt-1 leading-relaxed" style={{ color: colors.textMuted }}>
+                  PIN 码与手势密码的启用、关闭及策略由管理员统一设置，个人中心不再提供修改权限。
+                </Text>
               </View>
 
               {/* 生物识别快捷登录 */}
@@ -657,8 +640,8 @@ export default function ProfileScreen() {
         </ScrollView>
       )}
 
-      {/* PIN 码录入弹窗 */}
-      {showPinSetupModal && (
+      {/* PIN 码录入入口已移交管理员 */}
+      {false && showPinSetupModal && (
         <PinKeypadModal
           visible={showPinSetupModal}
           title="设置 4 位安全 PIN 码"
@@ -669,7 +652,6 @@ export default function ProfileScreen() {
           onSuccess={async (enteredPin) => {
             await savePinCode(enteredPin);
             setPinEnabled(true);
-            setCurrentPin(enteredPin);
             setShowPinSetupModal(false);
             setStatusMsg({ type: 'success', text: 'PIN 码设置成功并已开启保护' });
           }}

@@ -36,6 +36,7 @@ import {
   PlusCircle,
   Home,
   Feather,
+  Database,
 } from 'lucide-react-native';
 
 export default function HomeScreen() {
@@ -171,6 +172,14 @@ export default function HomeScreen() {
             style={{ borderColor: colors.cardBorder, backgroundColor: colors.cardBg }}
           >
             <Search size={16} color={colors.textSecondary} />
+          </Pressable>
+
+          <Pressable
+            onPress={() => router.push('/thought-database' as any)}
+            className="p-2 rounded-full border active:opacity-70"
+            style={{ borderColor: colors.cardBorder, backgroundColor: colors.cardBg }}
+          >
+            <Database size={16} color={colors.textSecondary} />
           </Pressable>
 
           {/* 管理员或已登录用户专属个人中心入口 */}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -19,12 +19,20 @@ import {
   detectContentType,
   uploadJournalImage,
   getTagCatalogDB,
+  checkIsAdmin,
   TagItem,
 } from '@/services/api';
 import * as ImagePicker from 'expo-image-picker';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
+import { getEditorDraft, saveEditorDraft, clearEditorDraft } from '@/utils/backup';
+import { getSecurityPolicyDB } from '@/services/api';
 import {
   ChevronLeft,
+  Undo2,
+  Redo2,
+  Type,
+  Palette,
+  ChevronDown,
   Save,
   Bold,
   Italic,
@@ -63,6 +71,18 @@ export default function EditorScreen() {
   const [weatherTag, setWeatherTag] = useState('晴');
   const [locationTag, setLocationTag] = useState('许昌');
   const [versionNote, setVersionNote] = useState('');
+  const contentInputRef = useRef<TextInput>(null);
+  const historyRef = useRef<{ past: string[]; future: string[] }>({ past: [], future: [] });
+  const historyReadyRef = useRef(false);
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const [autosaveStatus, setAutosaveStatus] = useState('');
+  const [selectedFont, setSelectedFont] = useState('system');
+  const [selectedColor, setSelectedColor] = useState('#FFFFFF');
+  const [showQuoteModal, setShowQuoteModal] = useState(false);
+  const [quoteSpeaker, setQuoteSpeaker] = useState('');
+  const [quoteText, setQuoteText] = useState('');
+  const [showFontModal, setShowFontModal] = useState(false);
+  const [showColorModal, setShowColorModal] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -80,6 +100,7 @@ export default function EditorScreen() {
 
   // 插入代码块弹窗
   const [showCodeModal, setShowCodeModal] = useState(false);
+  const [showCodeLanguagePicker, setShowCodeLanguagePicker] = useState(false);
   const [codeLanguage, setCodeLanguage] = useState('typescript');
   const [codeContent, setCodeContent] = useState('');
 
@@ -117,39 +138,90 @@ export default function EditorScreen() {
 
   // 加载已有日志内容与标签字典
   useEffect(() => {
-    getTagCatalogDB().then((tags) => {
+    (async () => {
+      if (!(await checkIsAdmin())) {
+        router.replace('/' as any);
+        return;
+      }
+      const tags = await getTagCatalogDB();
       setCatalogTags(tags);
-    });
 
-    if (id) {
-      setLoading(true);
-      Promise.all([getJournalById(id), getJournalVersions(id)])
-        .then(([j, vList]) => {
-          if (j) {
-            setTitle(j.title);
-            setContent(j.content);
-            if (j.theme_tags?.length) setThemeTags(j.theme_tags);
-            if (j.mood_tag) setMoodTag(j.mood_tag);
-            if (j.weather_tag) setWeatherTag(j.weather_tag);
-            if (j.location_tag) setLocationTag(j.location_tag);
-          }
-          setVersions(vList);
-        })
-        .finally(() => setLoading(false));
-    }
+      if (!id) {
+        const draft = await getEditorDraft();
+        if (draft && (draft.title || draft.content)) {
+          setTitle(draft.title || '');
+          setContent(draft.content || '');
+          historyReadyRef.current = true;
+          setAutosaveStatus(`已恢复本机草稿 · ${new Date(draft.savedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`);
+        } else {
+          historyReadyRef.current = true;
+        }
+      }
+
+      if (id) {
+        setLoading(true);
+        Promise.all([getJournalById(id), getJournalVersions(id)])
+          .then(([j, vList]) => {
+            if (j) {
+              setTitle(j.title);
+              setContent(j.content);
+              historyRef.current = { past: [], future: [] };
+              historyReadyRef.current = true;
+              if (j.theme_tags?.length) setThemeTags(j.theme_tags);
+              if (j.mood_tag) setMoodTag(j.mood_tag);
+              if (j.weather_tag) setWeatherTag(j.weather_tag);
+              if (j.location_tag) setLocationTag(j.location_tag);
+            }
+            setVersions(vList);
+          })
+          .finally(() => setLoading(false));
+      }
+    })();
   }, [id]);
 
   // 在光标处插入文本（如果未定位光标，则默认追加到末尾）
-  const insertAtCursor = (textToInsert: string) => {
+  const updateContent = (next: string) => {
     setContent((prev) => {
-      const { start, end } = cursorSelection;
-      if (typeof start === 'number' && start >= 0 && start <= prev.length) {
-        const before = prev.slice(0, start);
-        const after = prev.slice(end >= start ? end : start);
-        return before + textToInsert + after;
+      if (prev === next) return prev;
+      if (historyReadyRef.current) {
+        historyRef.current.past.push(prev);
+        if (historyRef.current.past.length > 100) historyRef.current.past.shift();
+        historyRef.current.future = [];
+        setHistoryVersion(v => v + 1);
       }
-      return prev + (prev.endsWith('\n') || !prev ? '' : '\n') + textToInsert;
+      return next;
     });
+  };
+
+  const insertAtCursor = (textToInsert: string) => {
+    const { start, end } = cursorSelection;
+    const before = content.slice(0, Math.max(0, start));
+    const after = content.slice(Math.max(start, end));
+    const next = before + textToInsert + after;
+    updateContent(next);
+    const caret = before.length + textToInsert.length;
+    requestAnimationFrame(() => contentInputRef.current?.focus());
+    setTimeout(() => setCursorSelection({ start: caret, end: caret }), 0);
+  };
+
+  const undo = () => {
+    const past = historyRef.current.past;
+    if (!past.length) return;
+    const previous = past[past.length - 1];
+    historyRef.current.past = past.slice(0, -1);
+    historyRef.current.future.unshift(content);
+    setContent(previous);
+    setHistoryVersion(v => v + 1);
+  };
+
+  const redo = () => {
+    const future = historyRef.current.future;
+    if (!future.length) return;
+    const next = future[0];
+    historyRef.current.future = future.slice(1);
+    historyRef.current.past.push(content);
+    setContent(next);
+    setHistoryVersion(v => v + 1);
   };
 
   // 快捷在光标处插入 Markdown 语法
@@ -171,7 +243,7 @@ export default function EditorScreen() {
       const selected = content.slice(start, end);
       insertAtCursor(`<u>${selected}</u>`);
     } else {
-      insertAtCursor('<u>下划线文本</u>');
+      insertAtCursor('<u></u>');
     }
   };
 
@@ -202,12 +274,12 @@ export default function EditorScreen() {
     const c = Math.max(1, parseInt(tableCols, 10) || 3);
     let md = '\n';
     // 表头
-    md += '| ' + Array.from({ length: c }, (_, i) => `列 ${i + 1}`).join(' | ') + ' |\n';
+    md += '| ' + Array.from({ length: c }, (_, i) => '').join(' | ') + ' |\n';
     // 分割线
     md += '| ' + Array.from({ length: c }, () => '---').join(' | ') + ' |\n';
     // 数据行
     for (let i = 0; i < r; i++) {
-      md += '| ' + Array.from({ length: c }, (_, j) => `单元格 ${i + 1}-${j + 1}`).join(' | ') + ' |\n';
+      md += '| ' + Array.from({ length: c }, (_, j) => '').join(' | ') + ' |\n';
     }
     md += '\n';
     insertAtCursor(md);
@@ -217,7 +289,7 @@ export default function EditorScreen() {
   // 插入代码块
   const handleInsertCode = () => {
     const lang = codeLanguage.trim() || 'text';
-    const body = codeContent.trim() ? codeContent : '// 在此输入代码';
+    const body = codeContent;
     const md = `\n\`\`\`${lang}\n${body}\n\`\`\`\n`;
     insertAtCursor(md);
     setShowCodeModal(false);
@@ -270,7 +342,7 @@ export default function EditorScreen() {
           );
 
           // 4. 上传至 Storage journal-images bucket
-          const publicUrl = await uploadJournalImage(manipResult.uri, asset.fileName || 'photo.jpg');
+          const publicUrl = await uploadJournalImage(manipResult.uri, `${(asset.fileName || 'photo').replace(/\.[^/.]+$/, '')}.jpg`);
           const altName = asset.fileName?.replace(/\.[^/.]+$/, '') || '思辨配图';
           uploadedMarkdownList.push(`\n\n![${altName}](${publicUrl})\n\n`);
         } catch (uploadErr: any) {
@@ -326,6 +398,8 @@ export default function EditorScreen() {
       });
 
       if (res.data) {
+        await clearEditorDraft();
+        setAutosaveStatus('已保存');
         setSaveSuccess(true);
         setTimeout(() => {
           setSaveSuccess(false);
@@ -338,6 +412,37 @@ export default function EditorScreen() {
       setSaving(false);
     }
   };
+
+  const applyTextStyle = (font?: string, color?: string) => {
+    const { start, end } = cursorSelection;
+    if (!(end > start)) return;
+    const selected = content.slice(start, end);
+    const attrs = [color ? `data-mosi-color="${color}"` : '', font ? `data-mosi-font="${font}"` : ''].filter(Boolean).join(' ');
+    insertAtCursor(`<span ${attrs}>${selected}</span>`);
+  };
+
+  const editorSnapshotRef = useRef({ title:'', content:'', themeTags:['自我认知'] as string[], moodTag:'平静', weatherTag:'晴', locationTag:'许昌' });
+  useEffect(() => { editorSnapshotRef.current = { title, content, themeTags, moodTag, weatherTag, locationTag }; }, [title, content, themeTags, moodTag, weatherTag, locationTag]);
+
+  // 至少每30秒保存一次：本地加密草稿 + 已有文章云端静默保存；自动保存不创建版本历史。
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+    (async () => {
+      const policy = await getSecurityPolicyDB();
+      const interval = Math.max(30, Number(policy?.autosave_interval_seconds || 30));
+      const tick = async () => {
+        const snap = editorSnapshotRef.current;
+        if (!snap.content.trim() && !snap.title.trim()) return;
+        await saveEditorDraft({ id: id || undefined, title:snap.title, content:snap.content, savedAt:Date.now() });
+        if (id && snap.content.trim()) {
+          const res = await saveJournal({ id, title:snap.title.trim(), content:snap.content.trim(), content_type:detectContentType(snap.content), theme_tags:snap.themeTags, mood_tag:snap.moodTag, weather_tag:snap.weatherTag, location_tag:snap.locationTag, version_note:'自动保存', createVersion:false });
+          setAutosaveStatus(res.error ? '本地草稿已保存，云端稍后重试' : `自动保存 · ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`);
+        } else setAutosaveStatus(`本地自动保存 · ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`);
+      };
+      timer = setInterval(tick, interval * 1000);
+    })();
+    return () => { if (timer) clearInterval(timer); };
+  }, [id]);
 
   if (loading) {
     return (
@@ -411,7 +516,7 @@ export default function EditorScreen() {
         className="px-3 py-2 border-b flex-row items-center justify-between"
         style={{ backgroundColor: colors.bg, borderColor: colors.cardBorder }}
       >
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} className="flex-1">
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} className="flex-1"><Pressable onPress={undo} disabled={!historyRef.current.past.length} className="p-1.5 rounded-lg border mr-2" style={{ backgroundColor:colors.cardBg, borderColor:colors.cardBorder, opacity:historyRef.current.past.length?1:.4 }}><Undo2 size={16} color={colors.textPrimary}/></Pressable><Pressable onPress={redo} disabled={!historyRef.current.future.length} className="p-1.5 rounded-lg border mr-2" style={{ backgroundColor:colors.cardBg, borderColor:colors.cardBorder, opacity:historyRef.current.future.length?1:.4 }}><Redo2 size={16} color={colors.textPrimary}/></Pressable><Pressable onPress={()=>setShowFontModal(true)} className="flex-row items-center px-2 py-1 rounded-lg border mr-2" style={{backgroundColor:colors.cardBg,borderColor:colors.cardBorder}}><Type size={14} color={colors.textPrimary}/><Text className="text-xs ml-1" style={{color:colors.textPrimary}}>字体</Text><ChevronDown size={12} color={colors.textMuted}/></Pressable><Pressable onPress={()=>setShowColorModal(true)} className="flex-row items-center px-2 py-1 rounded-lg border mr-2" style={{backgroundColor:colors.cardBg,borderColor:colors.cardBorder}}><Palette size={14} color={selectedColor === '#FFFFFF' ? colors.textPrimary : selectedColor}/><Text className="text-xs ml-1" style={{color:colors.textPrimary}}>文字色</Text></Pressable>
           {/* 下划线直接插入按钮 (Ctrl+U 效果，不再弹出7种样式选择) */}
           <Pressable
             onPress={handleUnderlinePress}
@@ -477,7 +582,7 @@ export default function EditorScreen() {
           </Pressable>
 
           <Pressable
-            onPress={() => insertSyntax('> **学者**：“在此写下深刻的对话反思...”\n')}
+            onPress={() => setShowQuoteModal(true)}
             className="p-1.5 rounded-lg border mr-2"
             style={{ backgroundColor: colors.cardBg, borderColor: colors.cardBorder }}
           >
@@ -517,7 +622,7 @@ export default function EditorScreen() {
           </Pressable>
 
           <Pressable
-            onPress={() => insertSyntax('\n---\n')}
+            onPress={() => { insertSyntax('\n---\n'); requestAnimationFrame(() => contentInputRef.current?.focus()); }}
             className="p-1.5 rounded-lg border mr-2"
             style={{ backgroundColor: colors.cardBg, borderColor: colors.cardBorder }}
           >
@@ -702,7 +807,8 @@ export default function EditorScreen() {
               placeholder="在此铺陈思辨的长卷，支持 Markdown、对谈引用、下划线、表格、代码块..."
               placeholderTextColor={colors.textMuted}
               value={content}
-              onChangeText={setContent}
+              ref={contentInputRef}
+              onChangeText={updateContent}
               onSelectionChange={(e) => {
                 setCursorSelection(e.nativeEvent.selection);
               }}
@@ -844,14 +950,9 @@ export default function EditorScreen() {
             <Text className="text-xs font-semibold mb-1" style={{ color: colors.textSecondary }}>
               编程语言 / 类型
             </Text>
-            <TextInput
-              placeholder="typescript / python / json / markdown"
-              placeholderTextColor={colors.textMuted}
-              value={codeLanguage}
-              onChangeText={setCodeLanguage}
-              className="text-xs p-2.5 rounded-lg border mb-3"
-              style={{ backgroundColor: colors.bg, borderColor: colors.cardBorder, color: colors.textPrimary }}
-            />
+            <Pressable onPress={() => setShowCodeLanguagePicker(true)} className="flex-row items-center justify-between text-xs p-2.5 rounded-lg border mb-3" style={{ backgroundColor: colors.bg, borderColor: colors.cardBorder }}>
+              <Text style={{ color:colors.textPrimary, fontSize:12 }}>{codeLanguage}</Text><ChevronDown size={15} color={colors.textMuted}/>
+            </Pressable>
             <Text className="text-xs font-semibold mb-1" style={{ color: colors.textSecondary }}>
               代码内容
             </Text>
@@ -947,6 +1048,42 @@ export default function EditorScreen() {
             </Pressable>
           </Pressable>
         </Pressable>
+      </Modal>
+
+      {/* 引用/对谈定义：> 后内容完全由用户决定，不再强制“沉思对谈” */}
+      <Modal visible={showQuoteModal} transparent animationType="fade" onRequestClose={()=>setShowQuoteModal(false)}>
+        <Pressable className="flex-1 justify-center items-center bg-black/40 px-6" onPress={()=>setShowQuoteModal(false)}><Pressable className="w-full max-w-sm rounded-2xl p-5" style={{backgroundColor:colors.cardBg}} onPress={e=>e.stopPropagation()}>
+          <Text className="text-base font-bold mb-3" style={{color:colors.textPrimary}}>插入引用 / 思辨对谈</Text>
+          <Text className="text-xs mb-1" style={{color:colors.textSecondary}}>发言者（可自定义）</Text>
+          <TextInput value={quoteSpeaker} onChangeText={setQuoteSpeaker} placeholder="例如：学者、青年、我、未来的我" placeholderTextColor={colors.textMuted} className="p-2.5 rounded-lg border mb-3 text-xs" style={{backgroundColor:colors.bg,borderColor:colors.cardBorder,color:colors.textPrimary}}/>
+          <View className="flex-row flex-wrap gap-2 mb-3">{['学者','青年','我','未来的我','苏格拉底'].map(x=><Pressable key={x} onPress={()=>setQuoteSpeaker(x)} className="px-2.5 py-1.5 rounded-full border" style={{backgroundColor:colors.bg,borderColor:colors.cardBorder}}><Text className="text-[11px]" style={{color:colors.textSecondary}}>{x}</Text></Pressable>)}</View>
+          <TextInput value={quoteText} onChangeText={setQuoteText} multiline placeholder="输入你真正想引用/对谈的内容，不自动塞入任何默认文字" placeholderTextColor={colors.textMuted} className="p-2.5 rounded-lg border mb-4 min-h-[90px] text-xs" style={{backgroundColor:colors.bg,borderColor:colors.cardBorder,color:colors.textPrimary,textAlignVertical:'top'}}/>
+          <Pressable onPress={()=>{ insertAtCursor(`> ${quoteSpeaker.trim()?`**${quoteSpeaker.trim()}**：`:''}${quoteText.trim()}\n`); setQuoteSpeaker(''); setQuoteText(''); setShowQuoteModal(false); }} disabled={!quoteText.trim()} className="py-2.5 rounded-xl items-center" style={{backgroundColor:quoteText.trim()?colors.accent:colors.cardBorder}}><Text className="text-xs font-bold text-white">插入</Text></Pressable>
+        </Pressable></Pressable>
+      </Modal>
+
+      {/* 字体列表 */}
+      <Modal visible={showFontModal} transparent animationType="fade" onRequestClose={()=>setShowFontModal(false)}>
+        <Pressable className="flex-1 justify-center items-center bg-black/40 px-6" onPress={()=>setShowFontModal(false)}><Pressable className="w-full max-w-sm rounded-2xl p-5" style={{backgroundColor:colors.cardBg}} onPress={e=>e.stopPropagation()}>
+          <Text className="text-base font-bold mb-3" style={{color:colors.textPrimary}}>选择字体</Text>
+          {([['system','系统默认'],['sans-serif','无衬线'],['serif','衬线阅读'],['monospace','等宽代码'],['cursive','手写风格']] as const).map(([key,label])=><Pressable key={key} onPress={()=>{setSelectedFont(key); applyTextStyle(key, undefined); setShowFontModal(false)}} className="p-3 rounded-xl border mb-2" style={{backgroundColor:colors.bg,borderColor:colors.cardBorder}}><Text style={{color:colors.textPrimary,fontFamily:key==='system'?undefined:key,fontSize:14}}>{label}</Text></Pressable>)}
+        </Pressable></Pressable>
+      </Modal>
+
+      {/* 七色文字 */}
+      <Modal visible={showColorModal} transparent animationType="fade" onRequestClose={()=>setShowColorModal(false)}>
+        <Pressable className="flex-1 justify-center items-center bg-black/40 px-6" onPress={()=>setShowColorModal(false)}><Pressable className="w-full max-w-sm rounded-2xl p-5" style={{backgroundColor:colors.cardBg}} onPress={e=>e.stopPropagation()}>
+          <Text className="text-base font-bold mb-3" style={{color:colors.textPrimary}}>选择文字颜色</Text>
+          <View className="flex-row flex-wrap gap-2">{[['#FFFFFF','默认（白色）'],['#EF4444','红'],['#F97316','橙'],['#3B82F6','蓝'],['#EAB308','黄'],['#22C55E','绿'],['#6B7280','灰']].map(([color,label])=><Pressable key={color} onPress={()=>{setSelectedColor(color); applyTextStyle(undefined,color); setShowColorModal(false)}} className="flex-row items-center px-3 py-2 rounded-xl border" style={{borderColor:colors.cardBorder,backgroundColor:colors.bg}}><View className="w-4 h-4 rounded-full mr-1.5 border" style={{backgroundColor:color,borderColor:color==='#FFFFFF'?colors.cardBorder:color}}/><Text className="text-xs" style={{color:colors.textSecondary}}>{label}</Text></Pressable>)}</View>
+        </Pressable></Pressable>
+      </Modal>
+
+      {/* 代码语言列表 */}
+      <Modal visible={showCodeLanguagePicker} transparent animationType="fade" onRequestClose={()=>setShowCodeLanguagePicker(false)}>
+        <Pressable className="flex-1 justify-center items-center bg-black/40 px-6" onPress={()=>setShowCodeLanguagePicker(false)}><Pressable className="w-full max-w-sm rounded-2xl p-5" style={{backgroundColor:colors.cardBg}} onPress={e=>e.stopPropagation()}>
+          <Text className="text-base font-bold mb-3" style={{color:colors.textPrimary}}>选择代码类型</Text>
+          <View className="flex-row flex-wrap gap-2">{['text','typescript','javascript','python','java','kotlin','swift','c','cpp','csharp','go','rust','sql','json','xml','html','css','bash','markdown','latex'].map(lang=><Pressable key={lang} onPress={()=>{setCodeLanguage(lang);setShowCodeLanguagePicker(false)}} className="px-3 py-2 rounded-xl border" style={{backgroundColor:codeLanguage===lang?colors.accentBg:colors.bg,borderColor:codeLanguage===lang?colors.accent:colors.cardBorder}}><Text className="text-xs" style={{color:codeLanguage===lang?colors.accent:colors.textSecondary}}>{lang}</Text></Pressable>)}</View>
+        </Pressable></Pressable>
       </Modal>
 
       {/* 历史版本查看弹窗 */}

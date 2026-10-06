@@ -12,6 +12,7 @@ interface PinKeypadModalProps {
   onSuccess?: (enteredPin: string) => void;
   onConfirm?: (enteredPin: string) => void;
   onCancel?: () => void;
+  onLockout?: () => void;
   allowCancel?: boolean;
 }
 
@@ -24,11 +25,13 @@ export const PinKeypadModal: React.FC<PinKeypadModalProps> = ({
   onSuccess,
   onConfirm,
   onCancel,
+  onLockout,
   allowCancel = false,
 }) => {
   const { colors } = useTheme();
   const [pin, setPin] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [failedAttempts, setFailedAttempts] = useState(0);
 
   const triggerSuccess = (completedPin: string) => {
     if (onConfirm) onConfirm(completedPin);
@@ -47,11 +50,17 @@ export const PinKeypadModal: React.FC<PinKeypadModalProps> = ({
         if (newPin === targetPin) {
           setTimeout(() => {
             setPin('');
+            setFailedAttempts(0);
             triggerSuccess(newPin);
           }, 150);
         } else {
-          setErrorMsg('PIN 码错误，请重新输入');
-          setTimeout(() => setPin(''), 500);
+          const nextFailures = failedAttempts + 1;
+          setFailedAttempts(nextFailures);
+          setErrorMsg(nextFailures >= 5 ? 'PIN 连续错误 5 次，已退出当前会话' : `PIN 码错误，还可尝试 ${5 - nextFailures} 次`);
+          setTimeout(() => {
+            setPin('');
+            if (nextFailures >= 5) onLockout?.();
+          }, 500);
         }
       }
     } else {

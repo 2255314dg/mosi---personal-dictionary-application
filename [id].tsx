@@ -7,6 +7,7 @@ import {
   TextInput,
   ActivityIndicator,
   Share,
+  Modal,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -23,8 +24,14 @@ import {
   checkIsAdmin,
   deleteComment,
   getJournalDisplayTitle,
+  createShareLink,
+  deleteJournal,
+  JournalEntityLink,
+  getJournalEntities,
 } from '@/services/api';
 import { MarkdownRenderer } from '@/components/MarkdownRenderer';
+import { Image } from 'expo-image';
+import { speakMosiArticle, stopMosiReading } from '@/utils/reading';
 import { FloatingAudioPlayer } from '@/components/FloatingAudioPlayer';
 import {
   ChevronLeft,
@@ -41,6 +48,7 @@ import {
   FileDown,
   X,
   Check,
+  Database,
 } from 'lucide-react-native';
 
 export default function JournalDetailScreen() {
@@ -57,6 +65,8 @@ export default function JournalDetailScreen() {
   // 目录导航
   const [toc, setToc] = useState<{ id: string; title: string; level: number }[]>([]);
   const [showTocModal, setShowTocModal] = useState(false);
+  const [showShareModal, setShowShareModal] = useState(false);
+  const [shareUrl, setShareUrl] = useState('');
 
   // 留言输入
   const [nickname, setNickname] = useState('');
@@ -66,6 +76,8 @@ export default function JournalDetailScreen() {
 
   // 滚动与返回顶部
   const [showBackToTop, setShowBackToTop] = useState(false);
+  const [isReading, setIsReading] = useState(false);
+  const [thoughtEntities, setThoughtEntities] = useState<JournalEntityLink[]>([]);
   const scrollViewRef = useRef<ScrollView>(null);
 
   // 加载数据 (需登录验证)
@@ -91,6 +103,7 @@ export default function JournalDetailScreen() {
 
         if (isMounted) {
           setJournal(curJournal);
+          if (curJournal) setThoughtEntities(await getJournalEntities(curJournal.id));
           setAllJournals(journalsList);
           setComments(comms);
           setIsAdmin(adminStatus);
@@ -101,19 +114,7 @@ export default function JournalDetailScreen() {
             const extracted: { id: string; title: string; level: number }[] = [];
             lines.forEach((line, index) => {
               const trimmed = line.trim();
-              if (trimmed.startsWith('## ')) {
-                extracted.push({
-                  id: `h2-${index}`,
-                  title: trimmed.replace(/^##\s+/, ''),
-                  level: 2,
-                });
-              } else if (trimmed.startsWith('### ')) {
-                extracted.push({
-                  id: `h3-${index}`,
-                  title: trimmed.replace(/^###\s+/, ''),
-                  level: 3,
-                });
-              }
+              if (/^#\s+/.test(trimmed)) extracted.push({ id:`h1-${index}`, title:trimmed.replace(/^#\s+/,''), level:1 });
             });
             setToc(extracted);
           }
@@ -172,19 +173,9 @@ export default function JournalDetailScreen() {
 
   // 系统分享与复制链接
   const handleShare = async () => {
-    if (!journal) return;
-    try {
-      const title = getJournalDisplayTitle(journal);
-      const shareUrl = `https://miaoda.online/journal/${journal.id}`;
-      await Share.share({
-        title: `墨思 · ${title}`,
-        message: `《${title}》—— 墨思 · 用笔墨记录思考\n${shareUrl}`,
-        url: shareUrl,
-      });
-    } catch {
-      // 降级为复制链接
-      await Clipboard.setStringAsync(`https://miaoda.online/journal/${journal.id}`);
-    }
+    if (!journal || !isAdmin) return;
+    const result = await createShareLink(journal.id, 30);
+    if (result?.url) { setShareUrl(result.url); setShowShareModal(true); }
   };
 
   // 左右切篇逻辑
@@ -275,6 +266,13 @@ export default function JournalDetailScreen() {
           )}
 
           <Pressable
+            onPress={async()=>{if(isReading){await stopMosiReading();setIsReading(false)}else{await speakMosiArticle(journal.content,()=>setIsReading(true),()=>setIsReading(false));}}}
+            className="px-2.5 py-1.5 rounded-full border active:opacity-70"
+            style={{ borderColor: isReading ? colors.accent : colors.cardBorder, backgroundColor: isReading ? colors.accentBg : colors.cardBg }}
+          >
+            <Text className="text-[11px] font-bold" style={{color:isReading?colors.accent:colors.textSecondary}}>{isReading?'停止朗读':'朗读'}</Text>
+          </Pressable>
+          <Pressable
             onPress={handleShare}
             className="p-2 rounded-full border active:opacity-70"
             style={{ borderColor: colors.cardBorder, backgroundColor: colors.cardBg }}
@@ -282,6 +280,9 @@ export default function JournalDetailScreen() {
             <Share2 size={17} color={colors.textSecondary} />
           </Pressable>
 
+          {isAdmin && (
+            <Pressable onPress={async()=>{const ok=deleteJournal(journal.id);if(await ok)router.replace('/' as any)}} className="p-2 rounded-full border active:opacity-70" style={{borderColor:'#FCA5A5',backgroundColor:'#FEF2F2'}}><Trash2 size={17} color="#DC2626"/></Pressable>
+          )}
           {isAdmin && (
             <Pressable
               onPress={() => router.push(`/editor?id=${journal.id}` as any)}
@@ -378,6 +379,21 @@ export default function JournalDetailScreen() {
         </View>
 
         {/* 正文渲染区 (支持对话、图文、引用、7种下划线) */}
+        {thoughtEntities.length > 0 && (
+          <View className="mb-5 rounded-2xl border p-4" style={{ borderColor: colors.cardBorder, backgroundColor: colors.cardBg }}>
+            <View className="flex-row items-center justify-between mb-3">
+              <View className="flex-row items-center"><Database size={16} color={colors.accent} /><Text className="text-sm font-bold ml-2" style={{ color: colors.textPrimary }}>思想实体</Text></View>
+              <Pressable onPress={() => router.push(`/thought-database?journalId=${journal.id}` as any)}><Text className="text-xs font-semibold" style={{ color: colors.accent }}>管理</Text></Pressable>
+            </View>
+            <View className="flex-row flex-wrap gap-2">
+              {thoughtEntities.map((item) => (
+                <View key={item.id} className="px-2.5 py-1.5 rounded-full border" style={{ borderColor: colors.cardBorder, backgroundColor: colors.accentBg }}>
+                  <Text className="text-[11px] font-medium" style={{ color: colors.accent }}>{item.entity?.name || item.entity?.statement || item.entity_id.slice(0, 8)}</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+        )}
         <MarkdownRenderer content={journal.content} />
 
         {/* 底部前后篇切换卡片 */}
@@ -624,7 +640,7 @@ export default function JournalDetailScreen() {
                     scrollViewRef.current?.scrollTo({ y: (idx + 1) * 200, animated: true });
                   }}
                   className="py-2.5 px-2 rounded-lg flex-row items-center active:opacity-70"
-                  style={{ paddingLeft: item.level === 3 ? 24 : 8 }}
+                  style={{ paddingLeft: 8 }}
                 >
                   <Text
                     className="text-sm font-medium flex-1"
